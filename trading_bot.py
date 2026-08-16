@@ -67,12 +67,12 @@ SYMBOLS = {
 TRADEABLE = {k: v for k, v in SYMBOLS.items() if k != "SPY"}
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-BASE_TRADE_SIZE      = 200
+BASE_TRADE_SIZE      = 20
 TAKE_PROFIT_PCT      = 2.0
 STOP_LOSS_PCT        = 0.9
 TIME_STOP_MINS       = 120
 MAX_POSITIONS        = 3
-DAILY_LOSS_LIMIT     = 50
+DAILY_LOSS_LIMIT     = 10
 VIX_PAUSE_LEVEL      = 25
 EARNINGS_BLACKOUT    = 3
 TRAILING_ACTIVATE    = 1.5
