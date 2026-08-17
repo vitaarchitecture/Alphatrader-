@@ -492,4 +492,398 @@ def evaluate(sym):
     st=stoch(hist); vw=vwap_calc(hist); e9=ema(hist,9); e21=ema(hist,21)
     pvwap=((price-vw)/vw*100) if vw else None
 
-  
+    if abs(get_premarket_gap(sym))>PREMARKET_GAP_LIMIT: return None
+
+    criteria=[
+        ("RSI 38-58",        r  is not None and 38<=r<=58,              25),
+        ("MACD +ve",         m  is not None and m.get("histogram",0)>0, 25),
+        ("Above VWAP",       pvwap is not None and pvwap>0,             20),
+        ("EMA9>EMA21",       e9 and e21 and e9>e21,                     15),
+        ("Stoch<78",         st is not None and st<78,                  15),
+        ("Volume confirmed", volume_ok(sym),                            10),
+    ]
+
+    met_names={n for n,p,w in criteria if p}
+    score=sum(w for n,p,w in criteria if p)
+    mandatory_met=MANDATORY_SIGNALS.issubset(met_names)
+    confirming=len([n for n in met_names if n not in MANDATORY_SIGNALS])
+    signal=("BUY" if mandatory_met and confirming>=MIN_CONFIRMING and score>=MIN_SCORE else "WAIT")
+
+    return {"symbol":sym,"price":price,"signal":signal,"met":list(met_names),
+            "met_count":len(met_names),"score":score,
+            "mandatory_met":mandatory_met,"confirming":confirming,"rsi":r}
+
+# ── Trailing stop ─────────────────────────────────────────────────────────────
+def update_trail(sym, price):
+    pos=positions.get(sym)
+    if not pos: return
+    pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
+    if pnl_pct>=TRAILING_ACTIVATE:
+        if price>pos.get("peak_price",pos["entry_price"]):
+            positions[sym]["peak_price"]=price
+            new_stop=price*(1-TRAILING_DISTANCE/100)
+            if new_stop>(pos.get("trailing_stop") or 0):
+                positions[sym]["trailing_stop"]=new_stop
+
+# ── Exit check ────────────────────────────────────────────────────────────────
+def check_exit(sym, price):
+    pos=positions.get(sym)
+    if not pos: return None
+    pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
+    mins=(time.time()-pos["entry_time"])/60
+    trail=pos.get("trailing_stop")
+    if trail and price<trail: return ("TRAIL",       f"Trailing stop ${trail:.2f} ({pnl_pct:+.2f}%) 📉")
+    if pnl_pct>=TAKE_PROFIT_PCT:  return ("TAKE_PROFIT", f"+{pnl_pct:.2f}% take profit 🟢")
+    if pnl_pct<=-STOP_LOSS_PCT:   return ("STOP_LOSS",   f"{pnl_pct:.2f}% stop loss 🔴")
+    if mins>=TIME_STOP_MINS:      return ("TIME_STOP",   f"{pnl_pct:.2f}% after {mins:.0f}m ⏱")
+    return None
+
+# ── Execute buy ───────────────────────────────────────────────────────────────
+def execute_buy(analysis, sentiment):
+    global daily_pnl, consecutive_losses
+    sym=analysis["symbol"]; price=analysis["price"]; score=analysis["score"]
+
+    with trade_lock:
+        # ── All guards ───────────────────────────────────────────────────────
+        if sym in positions: return
+        if portfolio_halted:
+            log.info("Portfolio halted — no new trades"); return
+        if check_portfolio_hard_stop(): return
+        if daily_pnl<=-DAILY_LOSS_LIMIT: return
+        if near_earnings(sym):
+            telegram(f"⚠️ <b>{sym}</b> skipped — earnings blackout"); return
+        if sector_held(sym): return
+        if len(positions)>=MAX_POSITIONS: return
+        if sentiment["sentiment"]=="negative" and sentiment["score"]<35:
+            telegram(f"📰 <b>{sym}</b> skipped — {sentiment['reason']}"); return
+        if SYMBOLS[sym]["corr"]=="tech" and not market_allows_tech_long(): return
+        if not in_trading_window():
+            log.info(f"{sym} skipped — outside trading window (45min buffer)"); return
+        if not has_momentum(sym):
+            log.info(f"{sym} skipped — no momentum from open"); return
+        if fear_greed_score is not None and fear_greed_score<=FEAR_GREED_PAUSE: return
+
+        # NEW: 50MA filter
+        if not above_50ma(sym):
+            log.info(f"{sym} skipped — price below 50MA (downtrend)")
+            return
+
+        # NEW: Sector surge check
+        if sector_already_surging(sym):
+            return
+
+        # Position sizing — reduced if on a losing streak
+        if economic_blackout:
+            trade_val_raw = get_trade_size(score) * 0.5
+        else:
+            trade_val_raw = get_trade_size(score)
+
+        # Extra caution if consecutive losses
+        if consecutive_losses >= CONSEC_LOSS_THRESHOLD:
+            log.info(f"Consecutive losses: {consecutive_losses} — using reduced size ${REDUCED_TRADE_SIZE}")
+
+        acct=get_account()
+        if not acct: return
+        bp=float(acct.get("buying_power",0))
+        trade_val=min(trade_val_raw, bp*0.95)
+        if trade_val<10: return
+
+        qty=trade_val/price
+        limit_price=round(price*(1-LIMIT_OFFSET/100),2)
+        stop_price=round(price*(1-STOP_LOSS_PCT/100),2)
+        target=round(price*(1+TAKE_PROFIT_PCT/100),2)
+
+        try:
+            order=alpaca_post("/v2/orders",{
+                "symbol":sym,"qty":f"{qty:.4f}","side":"buy",
+                "type":"limit","limit_price":str(limit_price),
+                "time_in_force":"day","order_class":"bracket",
+                "stop_loss":{"stop_price":str(stop_price)},
+                "take_profit":{"limit_price":str(target)},
+            })
+
+            positions[sym]={
+                "entry_price":price,"qty":qty,"entry_time":time.time(),
+                "cost":trade_val,"order_id":order.get("id",""),
+                "stop":stop_price,"target":target,
+                "peak_price":price,"trailing_stop":None,"confidence":score,
+            }
+
+            streak_note = f"⚠️ Reduced size — {consecutive_losses} consecutive losses" if consecutive_losses>=CONSEC_LOSS_THRESHOLD else ""
+            ma50_val = sum(list(price_history[sym])[-50:])/50 if len(price_history[sym])>=50 else None
+            ma50_note = f"Above 50MA (${ma50_val:.2f}) ✅" if ma50_val else ""
+
+            telegram(
+                f"📥 <b>BUY {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
+                f"Limit: ${limit_price} | Size: ${trade_val:.0f} ({score}pt)\n"
+                f"Stop: ${stop_price} | Target: ${target}\n"
+                f"Signals: {' · '.join(analysis['met'])}\n"
+                f"📰 {sentiment['sentiment'].upper()} ({sentiment['score']}/100): {sentiment['reason']}\n"
+                + (f"📊 {ma50_note}\n" if ma50_note else "")
+                + (f"⚠️ {streak_note}\n" if streak_note else "")
+                + f"🛡 Bracket order on Alpaca"
+            )
+            last_signal[sym]=time.time()
+
+        except Exception as e:
+            log.error(f"Buy failed {sym}: {e}")
+            telegram(f"❌ <b>BUY failed</b> {sym}: {str(e)[:100]}")
+
+# ── Execute sell ──────────────────────────────────────────────────────────────
+def execute_sell(sym, reason, price):
+    global daily_pnl, consecutive_losses, last_trade_result
+    pos=positions.get(sym)
+    if not pos: return
+    with trade_lock:
+        try:
+            try: alpaca_delete(f"/v2/orders/{pos['order_id']}")
+            except: pass
+            alpaca_post("/v2/orders",{
+                "symbol":sym,"qty":f"{pos['qty']:.4f}",
+                "side":"sell","type":"market","time_in_force":"day",
+            })
+            pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
+            pnl_abs=(price-pos["entry_price"])*pos["qty"]
+            daily_pnl+=pnl_abs
+
+            # Update consecutive loss tracker
+            if pnl_abs > 0:
+                consecutive_losses=0
+                last_trade_result="win"
+            else:
+                consecutive_losses+=1
+                last_trade_result="loss"
+
+            session_trades.append({
+                "symbol":sym,"entry":pos["entry_price"],"exit":price,
+                "qty":pos["qty"],"pnl_pct":pnl_pct,"pnl_abs":pnl_abs,
+                "reason":reason,"held_mins":(time.time()-pos["entry_time"])/60,
+            })
+            del positions[sym]
+
+            emoji="🟢" if pnl_abs>=0 else "🔴"
+            streak_note=""
+            if consecutive_losses>=CONSEC_LOSS_THRESHOLD:
+                streak_note=f"\n⚠️ {consecutive_losses} losses in a row — trade size reduced to ${REDUCED_TRADE_SIZE}"
+            elif consecutive_losses==0 and last_trade_result=="win":
+                streak_note="\n✅ Win — full size restored" if pos.get("confidence",100)<75 else ""
+
+            telegram(
+                f"{emoji} <b>SELL {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
+                f"Entry: ${pos['entry_price']:.2f} → Exit: ${price:.2f}\n"
+                f"P&L: {pnl_pct:+.2f}% (${pnl_abs:+.2f})\n"
+                f"Reason: {reason} | Today: ${daily_pnl:+.2f}"
+                + streak_note
+            )
+        except Exception as e:
+            log.error(f"Sell failed {sym}: {e}")
+
+# ── Websocket ─────────────────────────────────────────────────────────────────
+def on_tick(sym, price, volume=None):
+    if not is_market_hours(): return
+    price_history[sym].append(price)
+    if volume: volume_history[sym].append(volume)
+    if open_price.get(sym) is None: open_price[sym]=price
+
+    if sym in positions:
+        update_trail(sym,price)
+        result=check_exit(sym,price)
+        if result:
+            _,reason=result
+            execute_sell(sym,reason,price)
+        return
+
+    if sym not in TRADEABLE: return
+    if portfolio_halted: return
+    if time.time()-last_signal.get(sym,0)<SIGNAL_COOLDOWN: return
+    if len(price_history[sym])<30: return
+
+    analysis=evaluate(sym)
+    if not analysis or analysis["signal"]!="BUY": return
+
+    log.info(f"⚡ {sym} BUY signal — score:{analysis['score']}")
+    last_signal[sym]=time.time()
+
+    def buy_thread():
+        sentiment=claude_sentiment(sym)
+        execute_buy(analysis,sentiment)
+
+    threading.Thread(target=buy_thread,daemon=True).start()
+
+def on_message(ws, message):
+    global ws_connected
+    try:
+        data=json.loads(message)
+        for msg in (data if isinstance(data,list) else [data]):
+            T=msg.get("T")
+            if T=="success":
+                if msg.get("msg")=="connected":
+                    ws.send(json.dumps({"action":"auth","key":ALPACA_KEY,"secret":ALPACA_SECRET}))
+                elif msg.get("msg")=="authenticated":
+                    ws_connected=True
+                    ws.send(json.dumps({"action":"subscribe",
+                        "trades":list(SYMBOLS.keys()),"quotes":list(SYMBOLS.keys())}))
+                    telegram("📡 <b>Websocket live</b> — streaming all symbols")
+            elif T=="t":
+                sym=msg.get("S"); price=msg.get("p"); size=msg.get("s")
+                if sym and price and sym in SYMBOLS:
+                    on_tick(sym,float(price),float(size) if size else None)
+            elif T=="error":
+                log.error(f"WS: {msg}")
+    except Exception as e:
+        log.error(f"WS parse: {e}")
+
+def on_error(ws,e):
+    global ws_connected; ws_connected=False; log.error(f"WS: {e}")
+
+def on_close(ws,c,m):
+    global ws_connected; ws_connected=False
+    telegram("⚠️ Stream disconnected — reconnecting...")
+
+def on_open(ws): log.info("WS opened")
+
+def start_websocket():
+    while True:
+        try:
+            ws=websocket.WebSocketApp(WS_URL,on_message=on_message,
+                on_error=on_error,on_close=on_close,on_open=on_open)
+            ws.run_forever(ping_interval=30,ping_timeout=10)
+        except Exception as e:
+            log.error(f"WS thread: {e}")
+        time.sleep(5)
+
+# ── Daily summary ─────────────────────────────────────────────────────────────
+def send_daily_summary():
+    fg=f"Fear & Greed: {fear_greed_score:.0f}" if fear_greed_score else ""
+    if not session_trades:
+        telegram(f"📊 <b>Daily Summary</b>\nNo trades today.\n{fg}"); return
+    total=sum(t["pnl_abs"] for t in session_trades)
+    wins=sum(1 for t in session_trades if t["pnl_abs"]>0)
+    wr=wins/len(session_trades)*100
+    by_sym={}
+    for t in session_trades: by_sym.setdefault(t["symbol"],[]).append(t["pnl_abs"])
+    sym_lines="\n".join(f"  {s}: ${sum(v):+.2f} ({len(v)} trades)" for s,v in by_sym.items())
+    spy_note=f"SPY: {spy_trend():+.2f}%" if spy_trend() is not None else ""
+    telegram(
+        f"📊 <b>Daily Summary v7</b> {'PAPER' if IS_PAPER else 'LIVE'}\n"
+        f"Trades: {len(session_trades)} | Win rate: {wr:.0f}%\n"
+        f"Total P&L: ${total:+.2f}\n"
+        f"Consecutive losses: {consecutive_losses}\n"
+        f"By symbol:\n{sym_lines}\n"
+        f"{spy_note} | {fg}\n"
+        f"{'✅ Profitable!' if total>0 else '❌ Reviewing signals'}"
+    )
+
+# ── Startup ───────────────────────────────────────────────────────────────────
+def startup():
+    global starting_portfolio_value
+    log.info("AlphaTrader v7 — Minimum Loss Edition")
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        log.error("Missing Alpaca keys"); raise SystemExit(1)
+    acct=get_account()
+    if not acct: log.error("Cannot connect to Alpaca"); raise SystemExit(1)
+
+    bp=float(acct.get("buying_power",0))
+    pv=float(acct.get("portfolio_value",0))
+    starting_portfolio_value=pv
+
+    for sym in SYMBOLS:
+        try:
+            r=requests.get(f"{ALPACA_DATA}/v2/stocks/{sym}/bars?timeframe=1Day&limit=2",
+                headers={"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET},
+                timeout=10)
+            bars=r.json().get("bars",[])
+            if len(bars)>=2:
+                prev_close[sym]=float(bars[-2]["c"])
+                open_price[sym]=float(bars[-1]["o"])
+        except: pass
+        time.sleep(0.1)
+
+    try:
+        for p in alpaca_get("/v2/positions"):
+            sym=p["symbol"]
+            if sym in SYMBOLS:
+                positions[sym]={"entry_price":float(p["avg_entry_price"]),"qty":float(p["qty"]),
+                    "entry_time":time.time()-1800,"cost":float(p["cost_basis"]),
+                    "order_id":"","peak_price":float(p["current_price"]),
+                    "trailing_stop":None,"confidence":60}
+    except: pass
+
+    refresh_all_data()
+
+    api_status=[
+        f"{'✅' if POLYGON_KEY else '❌'} Polygon",
+        f"{'✅' if FMP_KEY else '❌'} FMP",
+        f"{'✅' if AV_KEY else '❌'} Alpha Vantage",
+        f"{'✅' if ANTHROPIC_KEY else '❌'} Claude AI sentiment",
+    ]
+
+    telegram(
+        f"🚀 <b>AlphaTrader v7 — Minimum Loss Edition</b>\n"
+        f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
+        f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
+        f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
+        f"<b>Loss protections:</b>\n"
+        f"🛑 Portfolio hard stop: -{PORTFOLIO_HARD_STOP_PCT}% from ${pv:.2f}\n"
+        f"📉 Daily loss limit: ${DAILY_LOSS_LIMIT}\n"
+        f"📊 50MA trend filter: ON\n"
+        f"🔗 Sector surge check: ON\n"
+        f"⏰ Trade window: 10:15am–3:15pm ET\n"
+        f"📉 Reduced size after {CONSEC_LOSS_THRESHOLD} consecutive losses\n"
+        f"🚫 No averaging down\n\n"
+        f"<b>Data sources:</b>\n" + "\n".join(api_status) + "\n"
+        f"Fear & Greed: {f'{fear_greed_score:.0f}' if fear_greed_score else 'unavailable'}\n"
+        f"⚡ Websocket streaming active"
+    )
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    global daily_pnl
+    startup()
+    threading.Thread(target=start_websocket,daemon=True).start()
+
+    last_summary=None; vix_alerted=0; last_hourly_refresh=time.time()
+
+    while True:
+        try:
+            now=datetime.now(timezone.utc); today=now.date()
+            ny_h=(now.hour-4)%24; ny_m=now.minute
+
+            if time.time()-last_hourly_refresh>3600:
+                threading.Thread(target=refresh_all_data,daemon=True).start()
+                last_hourly_refresh=time.time()
+
+            if ny_h==9 and ny_m<35 and last_summary!=today:
+                daily_pnl=0.0
+
+            if ny_h==16 and ny_m<5 and last_summary!=today:
+                send_daily_summary(); last_summary=today
+
+            if should_close_all() and positions:
+                telegram("⏰ <b>3:45pm ET — closing all positions</b>")
+                for sym in list(positions.keys()):
+                    hist=list(price_history[sym])
+                    if hist: execute_sell(sym,"EOD close",hist[-1])
+
+            if is_market_hours() and time.time()-vix_alerted>300:
+                try:
+                    r=requests.get(f"{ALPACA_DATA}/v2/stocks/VIXY/trades/latest",
+                        headers={"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET},
+                        timeout=5)
+                    vix=float(r.json()["trade"]["p"])
+                    if vix>VIX_PAUSE_LEVEL:
+                        telegram(f"⚠️ <b>VIX {vix:.1f}</b> — pausing new entries")
+                        vix_alerted=time.time()
+                except: pass
+
+            # Check portfolio hard stop every 5 mins
+            if is_market_hours() and ny_m%5==0:
+                check_portfolio_hard_stop()
+
+        except Exception as e:
+            log.error(f"Main: {e}")
+
+        time.sleep(30)
+
+if __name__ == "__main__":
+    main()
