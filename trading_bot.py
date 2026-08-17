@@ -589,15 +589,19 @@ def execute_buy(analysis, sentiment):
         if trade_val<10: return
 
         qty=trade_val/price
-        limit_price=round(price*(1-LIMIT_OFFSET/100),2)
         stop_price=round(price*(1-STOP_LOSS_PCT/100),2)
         target=round(price*(1+TAKE_PROFIT_PCT/100),2)
 
         try:
+            # Use notional (dollar-based) market order — works for any account
+            # size including fractional shares. Bracket legs use limit orders.
             order=alpaca_post("/v2/orders",{
-                "symbol":sym,"qty":str(max(1,int(trade_val/price))),"side":"buy",
-                "type":"limit","limit_price":str(limit_price),
-                "time_in_force":"day","order_class":"bracket",
+                "symbol":sym,
+                "notional":f"{trade_val:.2f}",
+                "side":"buy",
+                "type":"market",
+                "time_in_force":"day",
+                "order_class":"bracket",
                 "stop_loss":{"stop_price":str(stop_price)},
                 "take_profit":{"limit_price":str(target)},
             })
@@ -615,7 +619,7 @@ def execute_buy(analysis, sentiment):
 
             telegram(
                 f"📥 <b>BUY {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
-                f"Limit: ${limit_price} | Size: ${trade_val:.0f} ({score}pt)\n"
+                f"Market order | Size: ${trade_val:.0f} ({score}pt)\n"
                 f"Stop: ${stop_price} | Target: ${target}\n"
                 f"Signals: {' · '.join(analysis['met'])}\n"
                 f"📰 {sentiment['sentiment'].upper()} ({sentiment['score']}/100): {sentiment['reason']}\n"
@@ -638,10 +642,16 @@ def execute_sell(sym, reason, price):
         try:
             try: alpaca_delete(f"/v2/orders/{pos['order_id']}")
             except: pass
-            alpaca_post("/v2/orders",{
-                "symbol":sym,"qty":f"{pos['qty']:.4f}",
-                "side":"sell","type":"market","time_in_force":"day",
-            })
+            # Sell uses qty from position record
+            # If qty < 1 (fractional from notional buy), use notional sell
+            held_qty = pos.get("qty", 0)
+            if held_qty >= 1:
+                sell_body = {"symbol":sym,"qty":f"{held_qty:.4f}",
+                             "side":"sell","type":"market","time_in_force":"day"}
+            else:
+                sell_body = {"symbol":sym,"notional":f"{pos['cost']:.2f}",
+                             "side":"sell","type":"market","time_in_force":"day"}
+            alpaca_post("/v2/orders", sell_body)
             pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
             pnl_abs=(price-pos["entry_price"])*pos["qty"]
             daily_pnl+=pnl_abs
@@ -777,7 +787,7 @@ def send_daily_summary():
 # ── Startup ───────────────────────────────────────────────────────────────────
 def startup():
     global starting_portfolio_value
-    log.info("AlphaTrader v7 — Minimum Loss Edition")
+    log.info("AlphaTrader v8 — Notional Orders Edition")
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error("Missing Alpaca keys"); raise SystemExit(1)
     acct=get_account()
@@ -819,7 +829,7 @@ def startup():
     ]
 
     telegram(
-        f"🚀 <b>AlphaTrader v7 — Minimum Loss Edition</b>\n"
+        f"🚀 <b>AlphaTrader v8 — Notional Orders Edition</b>\n"
         f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
         f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
         f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
