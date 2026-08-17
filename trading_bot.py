@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v7 — Minimum Loss Edition
+AlphaTrader Bot v8 — Notional Orders Edition
 New protections over v6:
   1. Portfolio hard stop — bot halts if account drops 10% from start
   2. Real-time correlation check — skips if same-sector stock already surging
