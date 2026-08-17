@@ -246,7 +246,7 @@ def fetch_polygon_news(symbol):
     if not POLYGON_KEY: return []
     try:
         r = requests.get("https://api.polygon.io/v2/reference/news",
-            params={"ticker": symbol, "limit": 10, "order": "desc",
+            params={"ticker": symbol, "limit": 10, "": "desc",
                     "sort": "published_utc", "apiKey": POLYGON_KEY}, timeout=10)
         return [a.get("title","") for a in r.json().get("results",[])] if r.ok else []
     except: return []
@@ -594,13 +594,13 @@ def execute_buy(analysis, sentiment):
         target=round(price*(1+TAKE_PROFIT_PCT/100),2)
 
         try:
-            order=alpaca_post("/v2/orders",{
-                "symbol":sym,"qty":f"{qty:.4f}","side":"buy",
-                "type":"limit","limit_price":str(limit_price),
-                "time_in_force":"day","order_class":"bracket",
-                "stop_loss":{"stop_price":str(stop_price)},
-                "take_profit":{"limit_price":str(target)},
-            })
+           order=alpaca_post("/v2/orders",{
+    "symbol":sym,"notional":f"{trade_val:.2f}","side":"buy",
+    "type":"market",
+    "time_in_force":"day","order_class":"bracket",
+    "stop_loss":{"stop_price":str(stop_price)},
+    "take_profit":{"limit_price":str(target)},
+})
 
             positions[sym]={
                 "entry_price":price,"qty":qty,"entry_time":time.time(),
