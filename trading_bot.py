@@ -61,7 +61,7 @@ SYMBOLS = {
     "TLT":   {"sector": "bonds",          "corr": "hedge"},
     "USO":   {"sector": "oil",            "corr": "commodity"},
 }
-TRADEABLE = {k: v for k, v in SYMBOLS.items() if k != "SPY"}
+TRADEABLE = {k: v for k, v in SYMBOLS.items() if k not in ["SPY", "GLD", "TLT", "USO"]}
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 BASE_TRADE_SIZE         = 200
