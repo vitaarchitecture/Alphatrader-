@@ -47,6 +47,8 @@ WS_URL        = "wss://stream.data.alpaca.markets/v2/iex"
 SYMBOLS = {
     "NVDA":  {"sector": "semiconductors", "corr": "tech"},
     "AMD":   {"sector": "semiconductors", "corr": "tech"},
+    "SMCI":  {"sector": "semiconductors", "corr": "tech"},   # +36% Aug, AI infrastructure
+    "MU":    {"sector": "semiconductors", "corr": "tech"},   # +630% 1yr, memory AI play
     "AAPL":  {"sector": "big_tech",       "corr": "tech"},
     "MSFT":  {"sector": "big_tech",       "corr": "tech"},
     "GOOGL": {"sector": "big_tech",       "corr": "tech"},
@@ -329,6 +331,7 @@ def refresh_all_data():
         "NVDA":"2026-08-26","AAPL":"2026-10-30","TSLA":"2026-10-21",
         "MSFT":"2026-10-28","GOOGL":"2026-10-28","META":"2026-10-28",
         "AMZN":"2026-10-29","AMD":"2026-10-28","NFLX":"2026-10-14",
+        "SMCI":"2026-08-26","MU":"2026-09-24",
     }
     earnings_cache = {**hardcoded, **fmp_earnings, **poly_earnings}
 
