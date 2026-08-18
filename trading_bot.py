@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v9 — Fixed Edition
+AlphaTrader Bot v11 — Crypto + Fixed Exits Edition
 New protections over v6:
   1. Portfolio hard stop — bot halts if account drops 10% from start
   2. Real-time correlation check — skips if same-sector stock already surging
@@ -45,17 +45,37 @@ WS_URL        = "wss://stream.data.alpaca.markets/v2/iex"
 
 # ── Symbols ───────────────────────────────────────────────────────────────────
 SYMBOLS = {
+    # Tech / semis
     "NVDA":  {"sector": "semiconductors", "corr": "tech"},
     "AMD":   {"sector": "semiconductors", "corr": "tech"},
-    "SMCI":  {"sector": "semiconductors", "corr": "tech"},   # +36% Aug, AI infrastructure
-    "MU":    {"sector": "semiconductors", "corr": "tech"},   # +630% 1yr, memory AI play
+    "SMCI":  {"sector": "semiconductors", "corr": "tech"},
+    "MU":    {"sector": "semiconductors", "corr": "tech"},
+    "INTC":  {"sector": "semiconductors", "corr": "tech"},
     "AAPL":  {"sector": "big_tech",       "corr": "tech"},
     "MSFT":  {"sector": "big_tech",       "corr": "tech"},
     "GOOGL": {"sector": "big_tech",       "corr": "tech"},
     "META":  {"sector": "big_tech",       "corr": "tech"},
     "AMZN":  {"sector": "big_tech",       "corr": "tech"},
+    "PLTR":  {"sector": "software",       "corr": "tech"},
     "TSLA":  {"sector": "ev_auto",        "corr": "tech"},
     "NFLX":  {"sector": "streaming",      "corr": "tech"},
+    "DIS":   {"sector": "streaming",      "corr": "consumer"},
+    # Financials — move independently of tech
+    "JPM":   {"sector": "banks",          "corr": "financial"},
+    "BAC":   {"sector": "banks",          "corr": "financial"},
+    "GS":    {"sector": "banks",          "corr": "financial"},
+    # Healthcare — defensive, uncorrelated
+    "LLY":   {"sector": "pharma",         "corr": "healthcare"},
+    "UNH":   {"sector": "health_ins",     "corr": "healthcare"},
+    # Energy stocks — Iran conflict tailwind
+    "XOM":   {"sector": "oil_majors",     "corr": "energy"},
+    "CVX":   {"sector": "oil_majors",     "corr": "energy"},
+    # Consumer staples/discretionary
+    "WMT":   {"sector": "retail",         "corr": "consumer"},
+    "COST":  {"sector": "retail",         "corr": "consumer"},
+    # Industrials
+    "CAT":   {"sector": "industrials",    "corr": "industrial"},
+    # Market filter + hedges
     "SPY":   {"sector": "etf",            "corr": "market"},
     "GLD":   {"sector": "gold",           "corr": "hedge"},
     "TLT":   {"sector": "bonds",          "corr": "hedge"},
@@ -65,10 +85,10 @@ TRADEABLE = {k: v for k, v in SYMBOLS.items() if k != "SPY"}
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 BASE_TRADE_SIZE         = 200
-TAKE_PROFIT_PCT         = 2.0
+TAKE_PROFIT_PCT         = 1.2
 STOP_LOSS_PCT           = 0.9      # kept at 0.9% per user preference
 TIME_STOP_MINS          = 120
-MAX_POSITIONS           = 3
+MAX_POSITIONS           = 6
 DAILY_LOSS_LIMIT        = 50
 VIX_PAUSE_LEVEL         = 25
 EARNINGS_BLACKOUT       = 3
@@ -81,6 +101,14 @@ MOMENTUM_MIN_PCT        = 0.05
 MANDATORY_SIGNALS       = {"MACD +ve", "RSI 38-58"}
 MIN_CONFIRMING          = 2
 MIN_SCORE               = 70
+
+# ── Crypto parameters (wider stops/targets for volatility) ───────────────────
+CRYPTO_SYMBOLS          = {"BTC/USD": "crypto", "ETH/USD": "crypto"}
+CRYPTO_TAKE_PROFIT      = 3.0     # wider target
+CRYPTO_STOP_LOSS        = 1.5     # wider stop (BTC noise > 0.9%)
+CRYPTO_TIME_STOP_MINS   = 240     # 4 hours — trends develop slower overnight
+MAX_CRYPTO_POSITIONS    = 2      # allocation bucket: max 2 of 6 slots
+MAX_STOCK_POSITIONS     = 4      # allocation bucket: max 4 of 6 slots
 FEAR_GREED_PAUSE        = 20
 PREMARKET_GAP_LIMIT     = 2.0
 
@@ -439,9 +467,14 @@ def volume_ok(sym):
 
 # ── Market state ──────────────────────────────────────────────────────────────
 def spy_trend():
-    hist=list(price_history["SPY"]); op=open_price.get("SPY")
-    if not hist or not op: return None
-    return (hist[-1]-op)/op*100
+    """SPY change measured from the WORSE of today's open or prior close.
+    Catches gap-down days where SPY opens low and trades flat."""
+    hist=list(price_history["SPY"])
+    if not hist: return None
+    op=open_price.get("SPY"); pc=prev_close.get("SPY")
+    refs=[r for r in (op,pc) if r]
+    if not refs: return None
+    return min((hist[-1]-r)/r*100 for r in refs)
 
 def market_allows_tech_long():
     t=spy_trend(); return True if t is None else t>=-0.3
@@ -477,8 +510,9 @@ def near_earnings(sym):
     except: return False
 
 def sector_held(sym):
-    sector=SYMBOLS[sym]["sector"]
-    return any(SYMBOLS[s]["sector"]==sector and s!=sym for s in positions)
+    if sym in CRYPTO_SYMBOLS: return False
+    sector=SYMBOLS.get(sym,{}).get("sector")
+    return any(SYMBOLS.get(s,{}).get("sector")==sector and s!=sym for s in positions)
 
 def get_premarket_gap(sym):
     pm=premarket_data.get(sym)
@@ -532,13 +566,23 @@ def update_trail(sym, price):
 def check_exit(sym, price):
     pos=positions.get(sym)
     if not pos: return None
+    is_crypto = pos.get("is_crypto", False)
+    tp = CRYPTO_TAKE_PROFIT   if is_crypto else TAKE_PROFIT_PCT
+    sl = CRYPTO_STOP_LOSS     if is_crypto else STOP_LOSS_PCT
+    ts = CRYPTO_TIME_STOP_MINS if is_crypto else TIME_STOP_MINS
     pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
     mins=(time.time()-pos["entry_time"])/60
     trail=pos.get("trailing_stop")
     if trail and price<trail: return ("TRAIL",       f"Trailing stop ${trail:.2f} ({pnl_pct:+.2f}%) 📉")
-    if pnl_pct>=TAKE_PROFIT_PCT:  return ("TAKE_PROFIT", f"+{pnl_pct:.2f}% take profit 🟢")
-    if pnl_pct<=-STOP_LOSS_PCT:   return ("STOP_LOSS",   f"{pnl_pct:.2f}% stop loss 🔴")
-    if mins>=TIME_STOP_MINS:      return ("TIME_STOP",   f"{pnl_pct:.2f}% after {mins:.0f}m ⏱")
+    if pnl_pct>=tp:  return ("TAKE_PROFIT", f"+{pnl_pct:.2f}% take profit 🟢")
+    if pnl_pct<=-sl: return ("STOP_LOSS",   f"{pnl_pct:.2f}% stop loss 🔴")
+    # CONDITIONAL time stop: only cut trades that are flat or negative.
+    # A trade in decent profit (>+0.4%) is working — let it run to target.
+    if mins>=ts and pnl_pct < 0.4:
+        return ("TIME_STOP", f"{pnl_pct:.2f}% after {mins:.0f}m — dead trade ⏱")
+    # Hard ceiling: nothing holds past 2x the time stop regardless
+    if mins>=ts*2:
+        return ("TIME_STOP", f"{pnl_pct:.2f}% after {mins:.0f}m — max hold ⏱")
     return None
 
 # ── Execute buy ───────────────────────────────────────────────────────────────
@@ -557,13 +601,19 @@ def execute_buy(analysis, sentiment):
             telegram(f"⚠️ <b>{sym}</b> skipped — earnings blackout"); return
         if sector_held(sym): return
         if len(positions)>=MAX_POSITIONS: return
+        # Allocation buckets: crypto and stocks can't crowd each other out
+        n_crypto = sum(1 for p in positions.values() if p.get("is_crypto"))
+        n_stock  = len(positions) - n_crypto
+        if sym in CRYPTO_SYMBOLS and n_crypto >= MAX_CRYPTO_POSITIONS: return
+        if sym not in CRYPTO_SYMBOLS and n_stock >= MAX_STOCK_POSITIONS: return
         try:
             sent_score = int(float(sentiment.get("score", 50)))
         except (ValueError, TypeError):
             sent_score = 50
         if sentiment.get("sentiment")=="negative" and sent_score<35:
             telegram(f"📰 <b>{sym}</b> skipped — {sentiment['reason']}"); return
-        if SYMBOLS[sym]["corr"]=="tech" and not market_allows_tech_long(): return
+        if sym not in CRYPTO_SYMBOLS:
+            if SYMBOLS.get(sym,{}).get("corr")=="tech" and not market_allows_tech_long(): return
         if not in_trading_window():
             log.info(f"{sym} skipped — outside trading window (45min buffer)"); return
         if not has_momentum(sym):
@@ -595,52 +645,62 @@ def execute_buy(analysis, sentiment):
         trade_val=min(trade_val_raw, bp*0.95)
         if trade_val<10: return
 
-        shares = max(1, int(trade_val / price))
-        actual_cost = shares * price
-        stop_price  = round(price * (1 - STOP_LOSS_PCT/100), 2)
-        target      = round(price * (1 + TAKE_PROFIT_PCT/100), 2)
+        is_crypto = sym in CRYPTO_SYMBOLS
+        tp_pct = CRYPTO_TAKE_PROFIT if is_crypto else TAKE_PROFIT_PCT
+        sl_pct = CRYPTO_STOP_LOSS   if is_crypto else STOP_LOSS_PCT
+        stop_price  = round(price * (1 - sl_pct/100), 2)
+        target      = round(price * (1 + tp_pct/100), 2)
 
         try:
-            # Step 1: Place simple market buy order (no bracket)
-            order = alpaca_post("/v2/orders", {
-                "symbol":        sym,
-                "qty":           str(shares),
-                "side":          "buy",
-                "type":          "market",
-                "time_in_force": "day",
-            })
+            if is_crypto:
+                # Crypto: fractional notional order, no resting stop
+                # (crypto stops managed in software via websocket ticks)
+                shares = round(trade_val / price, 6)
+                actual_cost = trade_val
+                order = alpaca_post("/v2/orders", {
+                    "symbol":        sym,
+                    "notional":      f"{trade_val:.2f}",
+                    "side":          "buy",
+                    "type":          "market",
+                    "time_in_force": "gtc",
+                })
+            else:
+                shares = max(1, int(trade_val / price))
+                actual_cost = shares * price
+                # Step 1: market buy
+                order = alpaca_post("/v2/orders", {
+                    "symbol":        sym,
+                    "qty":           str(shares),
+                    "side":          "buy",
+                    "type":          "market",
+                    "time_in_force": "day",
+                })
             order_id = order.get("id", "")
+            stop_order_id = ""
 
-            # Step 2: Place stop loss order separately
-            try:
-                alpaca_post("/v2/orders", {
-                    "symbol":        sym,
-                    "qty":           str(shares),
-                    "side":          "sell",
-                    "type":          "stop",
-                    "stop_price":    str(stop_price),
-                    "time_in_force": "gtc",
-                })
-            except Exception as se:
-                log.warning(f"Stop loss order failed {sym}: {se}")
-
-            # Step 3: Place take profit limit order separately
-            try:
-                alpaca_post("/v2/orders", {
-                    "symbol":        sym,
-                    "qty":           str(shares),
-                    "side":          "sell",
-                    "type":          "limit",
-                    "limit_price":   str(target),
-                    "time_in_force": "gtc",
-                })
-            except Exception as te:
-                log.warning(f"Take profit order failed {sym}: {te}")
+            # Step 2 (stocks only): ONE resting stop-loss order as crash
+            # protection. Target is managed in software — no second resting
+            # sell, so shares are never double-reserved (SMCI bug fix).
+            if not is_crypto:
+                try:
+                    time.sleep(1)  # let buy fill before placing stop
+                    stop_order = alpaca_post("/v2/orders", {
+                        "symbol":        sym,
+                        "qty":           str(shares),
+                        "side":          "sell",
+                        "type":          "stop",
+                        "stop_price":    str(stop_price),
+                        "time_in_force": "gtc",
+                    })
+                    stop_order_id = stop_order.get("id", "")
+                except Exception as se:
+                    log.warning(f"Stop order failed {sym}: {se}")
 
             positions[sym]={
                 "entry_price":price,"qty":shares,"entry_time":time.time(),
                 "cost":actual_cost,"order_id":order_id,
-                "stop":stop_price,"target":target,
+                "stop_order_id":stop_order_id,
+                "stop":stop_price,"target":target,"is_crypto":is_crypto,
                 "peak_price":price,"trailing_stop":None,"confidence":score,
             }
 
@@ -671,15 +731,27 @@ def execute_sell(sym, reason, price):
     if not pos: return
     with trade_lock:
         try:
+            # CRITICAL: cancel the resting stop order first so shares are
+            # released before the market sell (fixes SMCI orphan bug)
+            if pos.get("stop_order_id"):
+                try:
+                    alpaca_delete(f"/v2/orders/{pos['stop_order_id']}")
+                    time.sleep(0.5)
+                except Exception:
+                    pass
             try: alpaca_delete(f"/v2/orders/{pos['order_id']}")
             except: pass
-            # Sell uses qty from position record
-            # If qty < 1 (fractional from notional buy), use notional sell
-            held_qty = int(pos.get("qty", 1))
-            alpaca_post("/v2/orders",{
-                "symbol":sym,"qty":str(max(1,held_qty)),
-                "side":"sell","type":"market","time_in_force":"day",
-            })
+            if pos.get("is_crypto"):
+                alpaca_post("/v2/orders",{
+                    "symbol":sym,"qty":f"{pos['qty']:.6f}",
+                    "side":"sell","type":"market","time_in_force":"gtc",
+                })
+            else:
+                held_qty = int(pos.get("qty", 1))
+                alpaca_post("/v2/orders",{
+                    "symbol":sym,"qty":str(max(1,held_qty)),
+                    "side":"sell","type":"market","time_in_force":"day",
+                })
             pnl_pct=(price-pos["entry_price"])/pos["entry_price"]*100
             pnl_abs=(price-pos["entry_price"])*pos["qty"]
             daily_pnl+=pnl_abs
@@ -790,6 +862,90 @@ def start_websocket():
             log.error(f"WS thread: {e}")
         time.sleep(5)
 
+
+# ── Crypto engine ─────────────────────────────────────────────────────────────
+# Crypto trades 24/7 via REST polling (30s). Separate from stock websocket.
+for _c in CRYPTO_SYMBOLS:
+    price_history[_c] = deque(maxlen=200)
+    volume_history[_c] = deque(maxlen=50)
+    open_price[_c] = None
+    prev_close[_c] = None
+    last_signal[_c] = 0
+
+def get_crypto_price(symbol):
+    try:
+        s = symbol.replace("/", "%2F")
+        r = requests.get(f"{ALPACA_DATA}/v1beta3/crypto/us/latest/trades?symbols={s}",
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            timeout=10)
+        if r.ok:
+            trades = r.json().get("trades", {})
+            t = trades.get(symbol) or next(iter(trades.values()), None)
+            if t: return float(t.get("p", 0)) or None
+        return None
+    except Exception:
+        return None
+
+def crypto_evaluate(sym):
+    """Same indicator logic as stocks but no market-hours/momentum-from-open
+    dependency — crypto has no open. Uses rolling window momentum instead."""
+    hist=price_history[sym]
+    if len(hist)<30: return None
+    price=hist[-1]; r=rsi(hist); m=macd_ind(hist)
+    st=stoch(hist); vw=vwap_calc(hist); e9=ema(hist,9); e21=ema(hist,21)
+    pvwap=((price-vw)/vw*100) if vw else None
+    # rolling momentum: last price vs 30 polls ago (~15 min)
+    roll_mom = (hist[-1]-hist[0])/hist[0]*100
+    criteria=[
+        ("RSI 38-58",        r  is not None and 38<=r<=58,              25),
+        ("MACD +ve",         m  is not None and m.get("histogram",0)>0, 25),
+        ("Above VWAP",       pvwap is not None and pvwap>0,             20),
+        ("EMA9>EMA21",       e9 and e21 and e9>e21,                     15),
+        ("Stoch<78",         st is not None and st<78,                  15),
+        ("Rolling momentum+",roll_mom>0,                                10),
+    ]
+    met_names={n for n,p,w in criteria if p}
+    score=sum(w for n,p,w in criteria if p)
+    mandatory_met=MANDATORY_SIGNALS.issubset(met_names)
+    confirming=len([n for n in met_names if n not in MANDATORY_SIGNALS])
+    signal=("BUY" if mandatory_met and confirming>=MIN_CONFIRMING and score>=MIN_SCORE else "WAIT")
+    return {"symbol":sym,"price":price,"signal":signal,"met":list(met_names),
+            "met_count":len(met_names),"score":score,
+            "mandatory_met":mandatory_met,"confirming":confirming,"rsi":r}
+
+def crypto_loop():
+    """Poll crypto prices every 30s, 24/7. Manage entries and exits."""
+    log.info("Crypto engine started — BTC/USD, ETH/USD, 24/7")
+    while True:
+        try:
+            for sym in CRYPTO_SYMBOLS:
+                p = get_crypto_price(sym)
+                if not p: continue
+                price_history[sym].append(p)
+
+                # Exits first
+                if sym in positions:
+                    update_trail(sym, p)
+                    result = check_exit(sym, p)
+                    if result:
+                        _, reason = result
+                        execute_sell(sym, reason, p)
+                    continue
+
+                if portfolio_halted: continue
+                if time.time()-last_signal.get(sym,0)<SIGNAL_COOLDOWN: continue
+                if len(price_history[sym])<30: continue
+
+                analysis = crypto_evaluate(sym)
+                if not analysis or analysis["signal"]!="BUY": continue
+                log.info(f"⚡ {sym} CRYPTO BUY signal — score:{analysis['score']}")
+                last_signal[sym]=time.time()
+                sentiment = {"sentiment":"neutral","score":50,"reason":"Crypto — technicals only"}
+                execute_buy(analysis, sentiment)
+        except Exception as e:
+            log.error(f"Crypto loop: {e}")
+        time.sleep(30)
+
 # ── Daily summary ─────────────────────────────────────────────────────────────
 def send_daily_summary():
     fg=f"Fear & Greed: {fear_greed_score:.0f}" if fear_greed_score else ""
@@ -815,7 +971,7 @@ def send_daily_summary():
 # ── Startup ───────────────────────────────────────────────────────────────────
 def startup():
     global starting_portfolio_value
-    log.info("AlphaTrader v9 — Fixed Edition")
+    log.info("AlphaTrader v11 — Crypto + Fixed Exits Edition")
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error("Missing Alpaca keys"); raise SystemExit(1)
     acct=get_account()
@@ -857,7 +1013,7 @@ def startup():
     ]
 
     telegram(
-        f"🚀 <b>AlphaTrader v9 — Fixed Edition</b>\n"
+        f"🚀 <b>AlphaTrader v11 — Crypto + Fixed Exits Edition</b>\n"
         f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
         f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
         f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
@@ -879,6 +1035,7 @@ def main():
     global daily_pnl
     startup()
     threading.Thread(target=start_websocket,daemon=True).start()
+    threading.Thread(target=crypto_loop,daemon=True).start()
 
     last_summary=None; vix_alerted=0; last_hourly_refresh=time.time()
 
@@ -897,9 +1054,10 @@ def main():
             if ny_h==16 and ny_m<5 and last_summary!=today:
                 send_daily_summary(); last_summary=today
 
-            if should_close_all() and positions:
-                telegram("⏰ <b>3:45pm ET — closing all positions</b>")
-                for sym in list(positions.keys()):
+            stock_positions = [s for s,p in positions.items() if not p.get("is_crypto")]
+            if should_close_all() and stock_positions:
+                telegram("⏰ <b>3:45pm ET — closing all stock positions</b> (crypto continues)")
+                for sym in stock_positions:
                     hist=list(price_history[sym])
                     if hist: execute_sell(sym,"EOD close",hist[-1])
 
