@@ -66,15 +66,11 @@ SYMBOLS = {
     "GS":    {"sector": "banks",          "corr": "financial"},
     # Healthcare — defensive, uncorrelated
     "LLY":   {"sector": "pharma",         "corr": "healthcare"},
-    "UNH":   {"sector": "health_ins",     "corr": "healthcare"},
     # Energy stocks — Iran conflict tailwind
     "XOM":   {"sector": "oil_majors",     "corr": "energy"},
     "CVX":   {"sector": "oil_majors",     "corr": "energy"},
     # Consumer staples/discretionary
-    "WMT":   {"sector": "retail",         "corr": "consumer"},
-    "COST":  {"sector": "retail",         "corr": "consumer"},
     # Industrials
-    "CAT":   {"sector": "industrials",    "corr": "industrial"},
     # Market filter + hedges
     "SPY":   {"sector": "etf",            "corr": "market"},
     "GLD":   {"sector": "gold",           "corr": "hedge"},
@@ -831,8 +827,7 @@ def on_message(ws, message):
                     ws.send(json.dumps({"action":"auth","key":ALPACA_KEY,"secret":ALPACA_SECRET}))
                 elif msg.get("msg")=="authenticated":
                     ws_connected=True
-                    ws.send(json.dumps({"action":"subscribe",
-                        "trades":list(SYMBOLS.keys()),"quotes":list(SYMBOLS.keys())}))
+                    ws.send(json.dumps({"action":"subscribe","trades":list(SYMBOLS.keys())}))
                     telegram("📡 <b>Websocket live</b> — streaming all symbols")
             elif T=="t":
                 sym=msg.get("S"); price=msg.get("p"); size=msg.get("s")
