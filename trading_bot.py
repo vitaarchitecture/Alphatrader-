@@ -236,10 +236,12 @@ def sector_already_surging(sym):
     Returns True if another stock in the same sector is already up
     significantly — meaning the move may be mature, not fresh.
     """
-    my_sector = SYMBOLS[sym]["sector"]
+    if sym in CRYPTO_SYMBOLS: return False
+    my_sector = SYMBOLS.get(sym,{}).get("sector")
+    if not my_sector: return False
     for other_sym, info in SYMBOLS.items():
         if other_sym == sym: return False
-        if info["sector"] != my_sector: continue
+        if info.get("sector") != my_sector: continue
         op = open_price.get(other_sym)
         hist = list(price_history[other_sym])
         if not op or not hist: continue
@@ -610,20 +612,15 @@ def execute_buy(analysis, sentiment):
             telegram(f"📰 <b>{sym}</b> skipped — {sentiment['reason']}"); return
         if sym not in CRYPTO_SYMBOLS:
             if SYMBOLS.get(sym,{}).get("corr")=="tech" and not market_allows_tech_long(): return
-        if not in_trading_window():
-            log.info(f"{sym} skipped — outside trading window (45min buffer)"); return
-        if not has_momentum(sym):
-            log.info(f"{sym} skipped — no momentum from open"); return
+            if not in_trading_window():
+                log.info(f"{sym} skipped — outside trading window (45min buffer)"); return
+            if not has_momentum(sym):
+                log.info(f"{sym} skipped — no momentum from open"); return
+            if not above_50ma(sym):
+                log.info(f"{sym} skipped — price below 50MA (downtrend)"); return
+            if sector_already_surging(sym):
+                return
         if fear_greed_score is not None and fear_greed_score<=FEAR_GREED_PAUSE: return
-
-        # NEW: 50MA filter
-        if not above_50ma(sym):
-            log.info(f"{sym} skipped — price below 50MA (downtrend)")
-            return
-
-        # NEW: Sector surge check
-        if sector_already_surging(sym):
-            return
 
         # Position sizing — reduced if on a losing streak
         if economic_blackout:
@@ -1017,7 +1014,9 @@ def startup():
         f"📉 Daily loss limit: ${DAILY_LOSS_LIMIT}\n"
         f"📊 50MA trend filter: ON\n"
         f"🔗 Sector surge check: ON\n"
-        f"⏰ Trade window: 10:15am–3:15pm ET\n"
+        f"\n<b>STOCKS:</b> +{TAKE_PROFIT_PCT}% / -{STOP_LOSS_PCT}% | {TIME_STOP_MINS//60}h stop | 10:15am–3:15pm ET | closes EOD\n"
+        f"<b>CRYPTO:</b> +{CRYPTO_TAKE_PROFIT}% / -{CRYPTO_STOP_LOSS}% | {CRYPTO_TIME_STOP_MINS//60}h stop | 24/7 | never closes\n"
+        f"Slots: {MAX_POSITIONS} total ({MAX_STOCK_POSITIONS} stock / {MAX_CRYPTO_POSITIONS} crypto)\n"
         f"📉 Reduced size after {CONSEC_LOSS_THRESHOLD} consecutive losses\n"
         f"🚫 No averaging down\n\n"
         f"<b>Data sources:</b>\n" + "\n".join(api_status) + "\n"
