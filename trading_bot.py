@@ -17,6 +17,7 @@ import json
 import logging
 import threading
 import requests
+import re
 import websocket
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -173,14 +174,23 @@ def get_account():
     except: return None
 
 def telegram(msg):
+    """Send to Telegram. Retries as plain text if HTML parsing fails
+    (criteria names like 'Stoch<78' and 'EMA9>EMA21' break HTML mode)."""
     if not TG_TOKEN or not TG_CHAT_ID:
         log.info(f"[TG] {msg}"); return
+    url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10)
+        r=requests.post(url, json={"chat_id":TG_CHAT_ID,"text":msg,
+                                   "parse_mode":"HTML"}, timeout=10)
+        if r.ok: return
+        log.warning(f"Telegram HTML rejected ({r.status_code}): {r.text[:160]}")
+        # Fallback: strip tags and send as plain text
+        plain=re.sub(r"</?b>","",msg)
+        r2=requests.post(url, json={"chat_id":TG_CHAT_ID,"text":plain}, timeout=10)
+        if not r2.ok:
+            log.error(f"Telegram plain also failed ({r2.status_code}): {r2.text[:160]}")
     except Exception as e:
-        log.warning(f"Telegram: {e}")
+        log.warning(f"Telegram send error: {e}")
 
 # ── NEW: Portfolio hard stop ──────────────────────────────────────────────────
 def check_portfolio_hard_stop():
@@ -533,8 +543,8 @@ def evaluate(sym):
         ("RSI 38-58",        r  is not None and 38<=r<=58,              25),
         ("MACD +ve",         m  is not None and m.get("histogram",0)>0, 25),
         ("Above VWAP",       pvwap is not None and pvwap>0,             20),
-        ("EMA9>EMA21",       e9 and e21 and e9>e21,                     15),
-        ("Stoch<78",         st is not None and st<78,                  15),
+        ("EMA9 over EMA21",       e9 and e21 and e9>e21,                     15),
+        ("Stoch under 78",         st is not None and st<78,                  15),
         ("Volume confirmed", volume_ok(sym),                            10),
     ]
 
@@ -942,8 +952,8 @@ def crypto_evaluate(sym):
         ("RSI 38-58",        r  is not None and 38<=r<=58,              25),
         ("MACD +ve",         m  is not None and m.get("histogram",0)>0, 25),
         ("Above VWAP",       pvwap is not None and pvwap>0,             20),
-        ("EMA9>EMA21",       e9 and e21 and e9>e21,                     15),
-        ("Stoch<78",         st is not None and st<78,                  15),
+        ("EMA9 over EMA21",       e9 and e21 and e9>e21,                     15),
+        ("Stoch under 78",         st is not None and st<78,                  15),
         ("Rolling momentum+",roll_mom>0,                                10),
     ]
     met_names={n for n,p,w in criteria if p}
