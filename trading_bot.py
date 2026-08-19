@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v12 — Sizing Fix + Crypto Paused
+AlphaTrader Bot v13 — Stop Loss Reliability
 New protections over v6:
   1. Portfolio hard stop — bot halts if account drops 10% from start
   2. Real-time correlation check — skips if same-sector stock already surging
@@ -675,19 +675,28 @@ def execute_buy(analysis, sentiment):
             # protection. Target is managed in software — no second resting
             # sell, so shares are never double-reserved (SMCI bug fix).
             if not is_crypto:
-                try:
-                    time.sleep(1)  # let buy fill before placing stop
-                    stop_order = alpaca_post("/v2/orders", {
-                        "symbol":        sym,
-                        "qty":           str(shares),
-                        "side":          "sell",
-                        "type":          "stop",
-                        "stop_price":    str(stop_price),
-                        "time_in_force": "gtc",
-                    })
-                    stop_order_id = stop_order.get("id", "")
-                except Exception as se:
-                    log.warning(f"Stop order failed {sym}: {se}")
+                for attempt in range(3):
+                    try:
+                        time.sleep(2 + attempt*2)  # wait for buy to fill
+                        stop_order = alpaca_post("/v2/orders", {
+                            "symbol":        sym,
+                            "qty":           str(shares),
+                            "side":          "sell",
+                            "type":          "stop",
+                            "stop_price":    str(stop_price),
+                            "time_in_force": "gtc",
+                        })
+                        stop_order_id = stop_order.get("id", "")
+                        log.info(f"Stop order placed {sym} @ ${stop_price}")
+                        break
+                    except Exception as se:
+                        log.warning(f"Stop attempt {attempt+1}/3 failed {sym}: {se}")
+                if not stop_order_id:
+                    log.error(f"NO STOP PROTECTION on {sym} — software stop only")
+                    try: telegram(f"⚠️ <b>{sym}</b>: broker stop could not be placed. "
+                                  f"Position protected by software stop only "
+                                  f"(inactive outside market hours).")
+                    except Exception: pass
 
             # Reconcile against Alpaca's actual position — protects against
             # partial fills where our estimate != what we really hold
@@ -1025,7 +1034,7 @@ def send_daily_summary():
 # ── Startup ───────────────────────────────────────────────────────────────────
 def startup():
     global starting_portfolio_value
-    log.info("AlphaTrader v12 — Sizing Fix + Crypto Paused")
+    log.info("AlphaTrader v13 — Stop Loss Reliability")
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error("Missing Alpaca keys"); raise SystemExit(1)
     acct=get_account()
@@ -1051,11 +1060,57 @@ def startup():
         for p in alpaca_get("/v2/positions"):
             sym=p["symbol"]
             if sym in SYMBOLS:
+                # Use Alpaca's own timestamp so the time stop survives restarts
+                try:
+                    o = alpaca_get(f"/v2/orders?symbols={sym}&status=closed&limit=5&direction=desc")
+                    fills=[x for x in o if x.get("side")=="buy" and x.get("filled_at")]
+                    if fills:
+                        ft=datetime.fromisoformat(fills[0]["filled_at"].replace("Z","+00:00"))
+                        entry_ts=ft.timestamp()
+                    else:
+                        entry_ts=time.time()-1800
+                except Exception:
+                    entry_ts=time.time()-1800
+                age_min=(time.time()-entry_ts)/60
                 positions[sym]={"entry_price":float(p["avg_entry_price"]),"qty":float(p["qty"]),
-                    "entry_time":time.time()-1800,"cost":float(p["cost_basis"]),
-                    "order_id":"","peak_price":float(p["current_price"]),
-                    "trailing_stop":None,"confidence":60}
+                    "entry_time":entry_ts,"cost":float(p["cost_basis"]),
+                    "order_id":"","stop_order_id":"","peak_price":float(p["current_price"]),
+                    "trailing_stop":None,"confidence":60,"is_crypto":"/" in sym}
+                log.info(f"Recovered position {sym}: {p['qty']} @ ${p['avg_entry_price']} "
+                         f"(age {age_min:.0f}min)")
+                # Re-arm a broker stop if none exists for this recovered position
+                try:
+                    open_orders=alpaca_get(f"/v2/orders?status=open&symbols={sym}")
+                    has_stop=any(x.get("type") in ("stop","stop_limit") for x in open_orders)
+                    if not has_stop and "/" not in sym:
+                        ep=float(p["avg_entry_price"])
+                        sp=round(ep*(1-STOP_LOSS_PCT/100),2)
+                        so=alpaca_post("/v2/orders",{"symbol":sym,"qty":str(int(float(p["qty"]))),
+                            "side":"sell","type":"stop","stop_price":str(sp),"time_in_force":"gtc"})
+                        positions[sym]["stop_order_id"]=so.get("id","")
+                        log.info(f"Re-armed missing stop for {sym} @ ${sp}")
+                except Exception as e2:
+                    log.warning(f"Could not re-arm stop for {sym}: {e2}")
     except: pass
+
+    # Startup safety sweep: flag positions already past their stop level
+    for _s,_p in list(positions.items()):
+        try:
+            _cur=get_crypto_price(_s) if _p.get("is_crypto") else None
+            if _cur is None:
+                _r=requests.get(f"{ALPACA_DATA}/v2/stocks/{_s}/trades/latest",
+                    headers={"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET},
+                    timeout=10)
+                _cur=float(_r.json()["trade"]["p"]) if _r.ok else None
+            if _cur:
+                _pnl=(_cur-_p["entry_price"])/_p["entry_price"]*100
+                _lim=-(CRYPTO_STOP_LOSS if _p.get("is_crypto") else STOP_LOSS_PCT)
+                if _pnl<=_lim:
+                    log.error(f"BREACH: {_s} at {_pnl:+.2f}% (stop {_lim}%) — needs exit")
+                    try: telegram(f"🚨 <b>{_s} past stop</b> at {_pnl:+.2f}%\n"
+                                  f"Will exit at next market open. Close manually if urgent.")
+                    except Exception: pass
+        except Exception: pass
 
     refresh_all_data()
 
@@ -1067,7 +1122,7 @@ def startup():
     ]
 
     telegram(
-        f"🚀 <b>AlphaTrader v12 — Sizing Fix + Crypto Paused</b>\n"
+        f"🚀 <b>AlphaTrader v13 — Stop Loss Reliability</b>\n"
         f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
         f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
         f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
