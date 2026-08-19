@@ -865,18 +865,36 @@ for _c in CRYPTO_SYMBOLS:
     last_signal[_c] = 0
 
 def get_crypto_price(symbol):
+    """Fetch latest crypto price. Tries trades endpoint, falls back to bars."""
+    s = symbol.replace("/", "%2F")
+    hdrs = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+    # Attempt 1: latest trades
     try:
-        s = symbol.replace("/", "%2F")
         r = requests.get(f"{ALPACA_DATA}/v1beta3/crypto/us/latest/trades?symbols={s}",
-            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
-            timeout=10)
+                         headers=hdrs, timeout=10)
         if r.ok:
             trades = r.json().get("trades", {})
             t = trades.get(symbol) or next(iter(trades.values()), None)
-            if t: return float(t.get("p", 0)) or None
-        return None
-    except Exception:
-        return None
+            if t and t.get("p"): return float(t["p"])
+        else:
+            log.warning(f"Crypto trades endpoint {symbol}: HTTP {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        log.warning(f"Crypto trades fetch {symbol}: {e}")
+    # Attempt 2: latest quotes (fallback)
+    try:
+        r = requests.get(f"{ALPACA_DATA}/v1beta3/crypto/us/latest/quotes?symbols={s}",
+                         headers=hdrs, timeout=10)
+        if r.ok:
+            q = r.json().get("quotes", {})
+            qq = q.get(symbol) or next(iter(q.values()), None)
+            if qq:
+                bid, ask = float(qq.get("bp",0)), float(qq.get("ap",0))
+                if bid and ask: return (bid+ask)/2
+        else:
+            log.warning(f"Crypto quotes endpoint {symbol}: HTTP {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        log.warning(f"Crypto quotes fetch {symbol}: {e}")
+    return None
 
 def crypto_evaluate(sym):
     """Same indicator logic as stocks but no market-hours/momentum-from-open
@@ -908,11 +926,19 @@ def crypto_evaluate(sym):
 def crypto_loop():
     """Poll crypto prices every 30s, 24/7. Manage entries and exits."""
     log.info("Crypto engine started — BTC/USD, ETH/USD, 24/7")
+    poll_count = 0
+    fail_count = 0
     while True:
         try:
+            poll_count += 1
             for sym in CRYPTO_SYMBOLS:
                 p = get_crypto_price(sym)
-                if not p: continue
+                if not p:
+                    fail_count += 1
+                    if fail_count in (1, 5, 20) or fail_count % 100 == 0:
+                        log.error(f"CRYPTO PRICE FETCH FAILING for {sym} "
+                                  f"({fail_count} failures) — crypto cannot trade")
+                    continue
                 price_history[sym].append(p)
 
                 # Exits first
@@ -934,8 +960,21 @@ def crypto_loop():
                 last_signal[sym]=time.time()
                 sentiment = {"sentiment":"neutral","score":50,"reason":"Crypto — technicals only"}
                 execute_buy(analysis, sentiment)
+            if poll_count % 10 == 0:
+                status = []
+                for s in CRYPTO_SYMBOLS:
+                    h = price_history[s]
+                    if h:
+                        r_ = rsi(h); m_ = macd_ind(h)
+                        rtxt = f"RSI {r_:.0f}" if r_ else "RSI --"
+                        mtxt = "MACD+" if (m_ and m_.get("histogram",0)>0) else "MACD-"
+                        status.append(f"{s} ${h[-1]:,.0f} [{len(h)}/30 pts, {rtxt}, {mtxt}]")
+                    else:
+                        status.append(f"{s} NO DATA")
+                held = [s for s in CRYPTO_SYMBOLS if s in positions]
+                log.info(f"Crypto heartbeat: {' | '.join(status)} | holding: {held or 'none'}")
         except Exception as e:
-            log.error(f"Crypto loop: {e}")
+            log.error(f"Crypto loop error: {e}")
         time.sleep(30)
 
 # ── Daily summary ─────────────────────────────────────────────────────────────
