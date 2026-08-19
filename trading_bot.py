@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v11 — Crypto + Fixed Exits Edition
+AlphaTrader Bot v12 — Sizing Fix + Crypto Paused
 New protections over v6:
   1. Portfolio hard stop — bot halts if account drops 10% from start
   2. Real-time correlation check — skips if same-sector stock already surging
@@ -80,7 +80,7 @@ SYMBOLS = {
 TRADEABLE = {k: v for k, v in SYMBOLS.items() if k != "SPY"}
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-BASE_TRADE_SIZE         = 200
+BASE_TRADE_SIZE         = 20
 TAKE_PROFIT_PCT         = 1.2
 STOP_LOSS_PCT           = 0.9      # kept at 0.9% per user preference
 TIME_STOP_MINS          = 120
@@ -103,7 +103,7 @@ CRYPTO_SYMBOLS          = {"BTC/USD": "crypto", "ETH/USD": "crypto"}
 CRYPTO_TAKE_PROFIT      = 3.0     # wider target
 CRYPTO_STOP_LOSS        = 1.5     # wider stop (BTC noise > 0.9%)
 CRYPTO_TIME_STOP_MINS   = 240     # 4 hours — trends develop slower overnight
-MAX_CRYPTO_POSITIONS    = 2      # allocation bucket: max 2 of 6 slots
+MAX_CRYPTO_POSITIONS    = 0   # PAUSED: bad indicator data + sizing bug      # allocation bucket: max 2 of 6 slots
 MAX_STOCK_POSITIONS     = 4      # allocation bucket: max 4 of 6 slots
 FEAR_GREED_PAUSE        = 20
 PREMARKET_GAP_LIMIT     = 2.0
@@ -689,6 +689,21 @@ def execute_buy(analysis, sentiment):
                 except Exception as se:
                     log.warning(f"Stop order failed {sym}: {se}")
 
+            # Reconcile against Alpaca's actual position — protects against
+            # partial fills where our estimate != what we really hold
+            try:
+                time.sleep(1.5)
+                real = alpaca_get(f"/v2/positions/{sym.replace('/','')}")
+                real_qty = abs(float(real.get("qty", shares)))
+                real_avg = float(real.get("avg_entry_price", price))
+                if real_qty > 0:
+                    if abs(real_qty - shares)/max(shares,1e-9) > 0.02:
+                        log.warning(f"{sym} fill mismatch: expected {shares} got {real_qty}")
+                    shares = real_qty; price = real_avg
+                    actual_cost = real_qty * real_avg
+            except Exception as re_:
+                log.warning(f"{sym} position reconcile failed, using estimate: {re_}")
+
             positions[sym]={
                 "entry_price":price,"qty":shares,"entry_time":time.time(),
                 "cost":actual_cost,"order_id":order_id,
@@ -697,24 +712,28 @@ def execute_buy(analysis, sentiment):
                 "peak_price":price,"trailing_stop":None,"confidence":score,
             }
 
-            streak_note = f"⚠️ Reduced size — {consecutive_losses} consecutive losses" if consecutive_losses>=CONSEC_LOSS_THRESHOLD else ""
-            ma50_val = sum(list(price_history[sym])[-50:])/50 if len(price_history[sym])>=50 else None
-            ma50_note = f"Above 50MA (${ma50_val:.2f}) ✅" if ma50_val else ""
-
-            telegram(
-                f"📥 <b>BUY {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
-                f"Market order | {shares} shares @ ~${price:.2f}\n"
-                f"Stop: ${stop_price} | Target: ${target}\n"
-                f"Signals: {' · '.join(analysis['met'])}\n"
-                f"📰 {str(sentiment.get('sentiment','neutral')).upper()} ({sentiment.get('score','?')}/100): {sentiment.get('reason','')}\n"
-                + (f"📊 {ma50_note}\n" if ma50_note else "")
-                + (f"⚠️ {streak_note}\n" if streak_note else "")
-                + f"🛡 Stop + target orders placed"
-            )
             last_signal[sym]=time.time()
+            # Always log the fill in plain text — cannot fail
+            log.info(f"FILLED BUY {sym}: {shares} @ ${price:.2f} "
+                     f"stop ${stop_price} target ${target} cost ${actual_cost:.2f}")
+
+            # Notification isolated: a formatting error must never hide a fill
+            try:
+                kind = "CRYPTO" if is_crypto else "STOCK"
+                qty_txt = f"{shares:.6f}" if is_crypto else f"{int(shares)} shares"
+                msg = (f"📥 <b>BUY {sym}</b> [{kind}] {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
+                       f"{qty_txt} @ ~${price:,.2f} = ${actual_cost:.2f}\n"
+                       f"Stop: ${stop_price:,.2f} ({-sl_pct}%) | "
+                       f"Target: ${target:,.2f} (+{tp_pct}%)\n"
+                       f"Score: {score} | {' · '.join(analysis.get('met',[]))}")
+                telegram(msg)
+            except Exception as te:
+                log.error(f"Buy notification failed {sym} (POSITION IS OPEN): {te}")
+                try: telegram(f"📥 BUY {sym} filled — details unavailable")
+                except Exception: pass
 
         except Exception as e:
-            log.error(f"Buy failed {sym}: {e}")
+            log.error(f"Buy ORDER failed {sym}: {e}")
             telegram(f"❌ <b>BUY failed</b> {sym}: {str(e)[:100]}")
 
 # ── Execute sell ──────────────────────────────────────────────────────────────
@@ -771,13 +790,17 @@ def execute_sell(sym, reason, price):
             elif consecutive_losses==0 and last_trade_result=="win":
                 streak_note="\n✅ Win — full size restored" if pos.get("confidence",100)<75 else ""
 
-            telegram(
-                f"{emoji} <b>SELL {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
-                f"Entry: ${pos['entry_price']:.2f} → Exit: ${price:.2f}\n"
-                f"P&L: {pnl_pct:+.2f}% (${pnl_abs:+.2f})\n"
-                f"Reason: {reason} | Today: ${daily_pnl:+.2f}"
-                + streak_note
-            )
+            log.info(f"FILLED SELL {sym}: exit ${price:.2f} P&L {pnl_pct:+.2f}% (${pnl_abs:+.2f}) — {reason}")
+            try:
+                telegram(
+                    f"{emoji} <b>SELL {sym}</b> {'(PAPER)' if IS_PAPER else '(LIVE)'}\n"
+                    f"Entry: ${pos['entry_price']:,.2f} → Exit: ${price:,.2f}\n"
+                    f"P&L: {pnl_pct:+.2f}% (${pnl_abs:+.2f})\n"
+                    f"Reason: {reason} | Today: ${daily_pnl:+.2f}"
+                    + streak_note
+                )
+            except Exception as te:
+                log.error(f"Sell notification failed {sym} (POSITION IS CLOSED): {te}")
         except Exception as e:
             log.error(f"Sell failed {sym}: {e}")
 
@@ -1002,7 +1025,7 @@ def send_daily_summary():
 # ── Startup ───────────────────────────────────────────────────────────────────
 def startup():
     global starting_portfolio_value
-    log.info("AlphaTrader v11 — Crypto + Fixed Exits Edition")
+    log.info("AlphaTrader v12 — Sizing Fix + Crypto Paused")
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error("Missing Alpaca keys"); raise SystemExit(1)
     acct=get_account()
@@ -1044,7 +1067,7 @@ def startup():
     ]
 
     telegram(
-        f"🚀 <b>AlphaTrader v11 — Crypto + Fixed Exits Edition</b>\n"
+        f"🚀 <b>AlphaTrader v12 — Sizing Fix + Crypto Paused</b>\n"
         f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
         f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
         f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
