@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v13 — Stop Loss Reliability
+AlphaTrader Bot v14 — Crypto Recovery + Orphan Cleanup
 New protections over v6:
   1. Portfolio hard stop — bot halts if account drops 10% from start
   2. Real-time correlation check — skips if same-sector stock already surging
@@ -1034,7 +1034,7 @@ def send_daily_summary():
 # ── Startup ───────────────────────────────────────────────────────────────────
 def startup():
     global starting_portfolio_value
-    log.info("AlphaTrader v13 — Stop Loss Reliability")
+    log.info("AlphaTrader v14 — Crypto Recovery + Orphan Cleanup")
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error("Missing Alpaca keys"); raise SystemExit(1)
     acct=get_account()
@@ -1058,8 +1058,24 @@ def startup():
 
     try:
         for p in alpaca_get("/v2/positions"):
-            sym=p["symbol"]
-            if sym in SYMBOLS:
+            raw_sym=p["symbol"]
+            # Alpaca returns crypto as "BTCUSD"; internally we use "BTC/USD"
+            sym=raw_sym
+            if raw_sym not in SYMBOLS:
+                for cs in CRYPTO_SYMBOLS:
+                    if cs.replace("/","")==raw_sym:
+                        sym=cs; break
+            # SAFETY: never adopt a short position — bot is long-only
+            try: _q=float(p.get("qty",0))
+            except Exception: _q=0
+            if _q < 0:
+                log.error(f"SHORT POSITION DETECTED {raw_sym} qty={_q} — NOT managed by bot")
+                try: telegram(f"🚨 <b>SHORT position open: {raw_sym} ({_q})</b>\n"
+                              f"This bot is long-only and will NOT manage it.\n"
+                              f"Close it manually in Alpaca.")
+                except Exception: pass
+                continue
+            if sym in SYMBOLS or sym in CRYPTO_SYMBOLS:
                 # Use Alpaca's own timestamp so the time stop survives restarts
                 try:
                     o = alpaca_get(f"/v2/orders?symbols={sym}&status=closed&limit=5&direction=desc")
@@ -1082,7 +1098,7 @@ def startup():
                 try:
                     open_orders=alpaca_get(f"/v2/orders?status=open&symbols={sym}")
                     has_stop=any(x.get("type") in ("stop","stop_limit") for x in open_orders)
-                    if not has_stop and "/" not in sym:
+                    if not has_stop and sym not in CRYPTO_SYMBOLS:
                         ep=float(p["avg_entry_price"])
                         sp=round(ep*(1-STOP_LOSS_PCT/100),2)
                         so=alpaca_post("/v2/orders",{"symbol":sym,"qty":str(int(float(p["qty"]))),
@@ -1092,6 +1108,20 @@ def startup():
                 except Exception as e2:
                     log.warning(f"Could not re-arm stop for {sym}: {e2}")
     except: pass
+
+    # Startup: cancel orphaned open orders (prevents accidental shorts)
+    try:
+        open_orders = alpaca_get("/v2/orders?status=open&limit=100")
+        held = {s.replace("/","") for s in positions}
+        for o in open_orders:
+            osym = o.get("symbol","")
+            if osym not in held:
+                try:
+                    alpaca_delete(f"/v2/orders/{o['id']}")
+                    log.warning(f"Cancelled orphaned {o.get('side')} order on {osym}")
+                except Exception: pass
+    except Exception as e:
+        log.warning(f"Orphan order sweep failed: {e}")
 
     # Startup safety sweep: flag positions already past their stop level
     for _s,_p in list(positions.items()):
@@ -1122,7 +1152,7 @@ def startup():
     ]
 
     telegram(
-        f"🚀 <b>AlphaTrader v13 — Stop Loss Reliability</b>\n"
+        f"🚀 <b>AlphaTrader v14 — Crypto Recovery + Orphan Cleanup</b>\n"
         f"Mode: {'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
         f"Symbols: {len(SYMBOLS)} ({len(TRADEABLE)} tradeable)\n"
         f"Buying power: ${bp:.2f} | Portfolio: ${pv:.2f}\n\n"
