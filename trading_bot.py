@@ -1,5 +1,39 @@
 """
-AlphaTrader Bot v18 — Time Bars + ATR Risk + Telegram Commands
+AlphaTrader Bot v20 — Audited Flatten + Hardening
+v20: full audit of v19 found its flatten fix was still wrong when the
+market is closed: (a) wait_for_fill cancels unfilled orders on timeout,
+killing the very GTC order meant to queue for the open; (b) the next
+reconcile pass's cancel_symbol_orders would kill it anyway; (c) re-placing
+reused the same client_order_id -> 422 spam. Net effect: no standing
+buy-back existed overnight, only log noise.
+
+v20 flatten protocol (tested against a closed-market mock):
+  1. If an open BUY for the symbol already exists -> it IS the queued
+     flatten. Leave it alone. Do nothing else that pass.
+  2. Cancel only SELL-side strays (they are how shorts happen), never
+     our own buy-back.
+  3. Place the GTC buy with a unique id; if market open, wait+verify;
+     if closed, LEAVE IT QUEUED (no wait_for_fill, no cancel).
+  4. When a later pass sees the symbol flat and an alert was pending,
+     send ONE '✅ flattened' confirmation.
+Also: ignore dust positions (<$1) instead of adopting them; whole-share
+fallback refuses symbols where 1 share costs >3x MAX_NOTIONAL.
+v19 fixes a real incident: v18's reconcile() tried to flatten a short with
+a DAY market order for a STOCK outside market hours. Day orders can't
+execute (or even queue reliably) when the exchange is shut, so the buy
+silently failed and the same "flattening now" alert repeated every 60s
+forever with no way to stop.
+
+Fixes:
+  * Flatten order uses time_in_force="gtc" for stocks too — queues and
+    fills at next open instead of silently failing when markets are shut.
+  * The flatten VERIFIES the fill (checks broker qty afterward) before
+    declaring success — no more "tried and moved on" with no confirmation.
+  * Per-symbol alert cooldown (10 min): the short IS still being worked
+    every reconcile pass, but you are only told about it once per window,
+    not every single minute.
+  * If markets are closed and the symbol is a stock, the first alert
+    says so explicitly, so you know why it can't fill immediately.
 v18 on top of v17 (the two 'expert review' fixes, plus visibility):
   * ALL indicators now computed on 1-MINUTE BARS, not raw ticks.
     Ticks arrive at wildly different rates per symbol, so tick-RSI meant
@@ -63,7 +97,7 @@ import requests, websocket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
-VERSION = "v18"
+VERSION = "v20"
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -176,6 +210,8 @@ last_signal    = {s: 0 for s in list(SYMBOLS)+list(CRYPTO_SYMBOLS)}
 
 earnings_cache={}; economic_events=[]; fear_greed=None; premarket={}; econ_blackout=False
 vix_level=None
+short_alerts={}                    # sym -> last alert time (throttle spam)
+SHORT_ALERT_COOLDOWN_S=600
 block_counts={}                    # reason -> count (reset daily)
 exit_pending=set()                 # throttle duplicate exit threads
 notional_ok=True                   # stocks: flip False on first 422, fallback to shares
@@ -239,17 +275,26 @@ def broker_position(sym):
     except Exception:
         raise
 
-def cancel_symbol_orders(sym):
-    """Cancel every open order for a symbol. v16 rests no orders, so any
-    open order is foreign by definition."""
+def cancel_symbol_orders(sym, side=None):
+    """Cancel open orders for a symbol (optionally one side only).
+    v16+ rests no orders, so any open order is foreign — EXCEPT a
+    flatten buy-back deliberately queued for the next open."""
     try:
         for o in alpaca_get(f"/v2/orders?status=open&symbols={to_alpaca(sym)}") or []:
+            if side and o.get("side")!=side: continue
             try:
                 alpaca_delete(f"/v2/orders/{o['id']}")
                 log.warning(f"Cancelled open order on {sym}: {o.get('side')} {o.get('qty')}")
             except Exception: pass
     except Exception as e:
         log.warning(f"cancel_symbol_orders {sym}: {e}")
+
+def open_orders_for(sym, side=None):
+    try:
+        oo=alpaca_get(f"/v2/orders?status=open&symbols={to_alpaca(sym)}") or []
+        return [o for o in oo if not side or o.get("side")==side]
+    except Exception:
+        return []
 
 def wait_for_fill(order_id, timeout=FILL_TIMEOUT_S):
     """Poll an order until filled. Returns (filled_qty, avg_price) or (0,0)."""
@@ -325,6 +370,9 @@ def place_entry(sym, price, score, met):
                     log.warning(f"Notional rejected ({txt}) — falling back to whole shares")
                     notional_ok=False
             if order is None:
+                if price > MAX_NOTIONAL*3:
+                    log.info(f"{sym} skipped in whole-share fallback: 1 share "
+                             f"${price:.0f} >> risk budget"); return
                 shares=max(1,int(tv/price))
                 try:
                     order=alpaca_post("/v2/orders",{"symbol":sym,"qty":str(shares),
@@ -435,30 +483,66 @@ def reconcile():
         except Exception: q=0
         seen.add(sym)
         if q<0:
-            log.error(f"SHORT at broker: {raw} {q} — flattening")
-            try: telegram(f"🚨 <b>Short detected: {raw} ({q})</b> — buying back to flatten now.")
-            except Exception: pass
+            is_c=sym in CRYPTO_SYMBOLS
+            can_fill_now = is_c or is_market_hours()
+            # 0) confirmation path lives below (q>=0); here we work the short.
+            # 1) If our buy-back is already queued, leave it be — it will fill
+            #    at the open. Re-placing/cancelling was v19's failure mode.
+            existing_buys=open_orders_for(sym, side="buy")
+            if existing_buys and not can_fill_now:
+                continue
+            last_alert=short_alerts.get(sym,0)
+            if time.time()-last_alert>SHORT_ALERT_COOLDOWN_S:
+                short_alerts[sym]=time.time()
+                note = "" if can_fill_now else " (market closed — buy-back queued for the open)"
+                log.error(f"SHORT at broker: {raw} {q} — working{note}")
+                try: telegram(f"🚨 <b>Short detected: {raw} ({q})</b> — "
+                              f"buy-back working{note}.")
+                except Exception: pass
             with state_lock:
                 if sym in in_flight: continue
                 in_flight.add(sym)
             try:
-                cancel_symbol_orders(sym)
-                o=alpaca_post("/v2/orders",{"symbol":raw,"qty":str(int(abs(q))),"side":"buy",
-                    "type":"market","time_in_force":"day",
-                    "client_order_id":f"at17flat-{raw}-{int(time.time())}"})
-                wait_for_fill(o.get("id",""))
-                log.info(f"Flattened short {raw}")
+                # 2) kill sell-side strays only — never our own buy-back
+                cancel_symbol_orders(sym, side="sell")
+                if not existing_buys:
+                    o=alpaca_post("/v2/orders",{"symbol":raw,"qty":str(int(abs(q))),
+                        "side":"buy","type":"market","time_in_force":"gtc",
+                        "client_order_id":f"at20flat-{raw}-{int(time.time()*1000)}"})
+                    if can_fill_now:
+                        wait_for_fill(o.get("id",""))
+                    # market closed: DO NOT wait (wait cancels on timeout).
+                    # The order stays queued; step 1 protects it next pass.
+                if can_fill_now:
+                    nq,_=broker_position(sym)
+                    if nq>=0:
+                        log.info(f"Flattened short {raw} (confirmed qty {nq})")
+                        short_alerts.pop(sym,None)
+                        try: telegram(f"✅ <b>{raw} flattened</b> — position now {nq}")
+                        except Exception: pass
             except Exception as e:
                 log.error(f"flatten {raw} failed: {e}")
             finally:
                 with state_lock: in_flight.discard(sym)
             continue
+        # queued flatten completed since last pass? confirm once.
+        if sym in short_alerts and q>=0:
+            short_alerts.pop(sym,None)
+            log.info(f"Short {raw} confirmed flat (queued buy filled)")
+            try: telegram(f"✅ <b>{raw} flattened</b> — position now {q}")
+            except Exception: pass
         with state_lock:
             if sym in positions:
                 if abs(positions[sym]["qty"]-q)/max(q,1e-9)>0.01:
                     log.warning(f"reconcile {sym}: qty {positions[sym]['qty']} -> {q}")
                     positions[sym]["qty"]=q
             elif (sym in SYMBOLS or sym in CRYPTO_SYMBOLS) and sym not in in_flight:
+                try:
+                    _px=float(p.get("current_price") or p.get("avg_entry_price") or 0)
+                    if q*_px < 1.0:
+                        log.info(f"Ignoring dust position {sym}: {q} (~${q*_px:.2f})")
+                        continue
+                except Exception: pass
                 entry_ts=time.time()-1800
                 try:
                     hist=alpaca_get(f"/v2/orders?symbols={raw}&status=closed&limit=5&direction=desc") or []
@@ -477,6 +561,14 @@ def reconcile():
         for sym in [s for s in positions if s not in seen and s not in in_flight]:
             log.warning(f"reconcile: {sym} gone at broker — purging")
             positions.pop(sym,None)
+    # a symbol with a pending short-alert that no longer appears at the broker
+    # is FLAT (Alpaca omits flat positions) — confirm once and clear.
+    for sym in [s for s in list(short_alerts) if s not in seen]:
+        short_alerts.pop(sym,None)
+        raw=to_alpaca(sym)
+        log.info(f"Short {raw} confirmed flat (position gone at broker)")
+        try: telegram(f"✅ <b>{raw} flattened</b> — position closed")
+        except Exception: pass
 
 def reconciler_loop():
     while True:
