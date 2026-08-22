@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v20 — Audited Flatten + Hardening
+AlphaTrader Bot v21 — Time Stop Fix + Mega Drop + Crypto On
 v20: full audit of v19 found its flatten fix was still wrong when the
 market is closed: (a) wait_for_fill cancels unfilled orders on timeout,
 killing the very GTC order meant to queue for the open; (b) the next
@@ -97,7 +97,7 @@ import requests, websocket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
-VERSION = "v20"
+VERSION = "v21"
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -121,9 +121,7 @@ WS_URL      = "wss://stream.data.alpaca.markets/v2/iex"
 SYMBOLS = {
     "NVDA":{"sector":"semis","corr":"tech"},   "AMD":{"sector":"semis","corr":"tech"},
     "SMCI":{"sector":"semis","corr":"tech"},   "MU":{"sector":"semis","corr":"tech"},
-    "INTC":{"sector":"semis","corr":"tech"},   "AAPL":{"sector":"bigtech","corr":"tech"},
-    "MSFT":{"sector":"bigtech","corr":"tech"}, "GOOGL":{"sector":"bigtech","corr":"tech"},
-    "META":{"sector":"bigtech","corr":"tech"}, "AMZN":{"sector":"bigtech","corr":"tech"},
+    "INTC":{"sector":"semis","corr":"tech"},
     "PLTR":{"sector":"software","corr":"tech"},"TSLA":{"sector":"ev","corr":"tech"},
     "NFLX":{"sector":"stream","corr":"tech"},  "DIS":{"sector":"stream","corr":"consumer"},
     "JPM":{"sector":"banks","corr":"fin"},     "BAC":{"sector":"banks","corr":"fin"},
@@ -367,8 +365,11 @@ def place_entry(sym, price, score, met):
                     txt=e.response.text[:150] if e.response is not None else str(e)
                     if "client_order_id" in txt:
                         log.warning(f"Entry deduped {sym}"); return
-                    log.warning(f"Notional rejected ({txt}) — falling back to whole shares")
-                    notional_ok=False
+                    if "notional" in txt.lower() and "not supported" in txt.lower():
+                        log.warning("Account doesnt support notional — switching to whole shares")
+                        notional_ok=False
+                    else:
+                        log.warning(f"Notional rejected for {sym} ({txt[:80]}) — trying whole shares for this symbol")
             if order is None:
                 if price > MAX_NOTIONAL*3:
                     log.info(f"{sym} skipped in whole-share fallback: 1 share "
@@ -795,7 +796,7 @@ def check_exit(sym, price):
     if pnl>=tp:  return f"+{pnl:.2f}% take profit 🟢"
     if pnl<=-sl: return f"{pnl:.2f}% stop loss 🔴"
     if mins>=ts and pnl<TIME_STOP_FLOOR: return f"{pnl:+.2f}% after {mins:.0f}m — dead trade ⏱"
-    if mins>=ts*2: return f"{pnl:+.2f}% after {mins:.0f}m — max hold ⏱"
+    if mins>=240: return f"{pnl:+.2f}% after {mins:.0f}m — max 4h hold ⏱"
     return None
 
 # ── Guards before entry (full stack) ──────────────────────────────────────────
@@ -998,8 +999,8 @@ def refresh_data():
     global earnings_cache,economic_events,econ_blackout,fear_greed
     try:
         hard={"NVDA":"2026-08-26","SMCI":"2026-08-26","MU":"2026-09-24",
-              "AAPL":"2026-10-30","TSLA":"2026-10-21","MSFT":"2026-10-28",
-              "GOOGL":"2026-10-28","META":"2026-10-28","AMZN":"2026-10-29",
+              "TSLA":"2026-10-21",
+              
               "AMD":"2026-10-28","NFLX":"2026-10-14"}
         fmp={}
         if FMP_KEY:
