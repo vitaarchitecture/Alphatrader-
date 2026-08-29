@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v21 — Time Stop Fix + Mega Drop + Crypto On
+AlphaTrader Bot v22 — EOD Hold + Crypto Swing Edition
 v20: full audit of v19 found its flatten fix was still wrong when the
 market is closed: (a) wait_for_fill cancels unfilled orders on timeout,
 killing the very GTC order meant to queue for the open; (b) the next
@@ -97,7 +97,7 @@ import requests, websocket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
-VERSION = "v21"
+VERSION = "v22"
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -152,9 +152,9 @@ TAKE_PROFIT_PCT   = 1.2
 STOP_LOSS_PCT     = 0.9
 TIME_STOP_MINS    = 120
 TIME_STOP_FLOOR   = 0.4      # conditional: only cut if pnl below this at time-stop
-CRYPTO_TP         = 3.0
-CRYPTO_SL         = 1.5
-CRYPTO_TS_MINS    = 240
+CRYPTO_TP         = 6.0   # swing scale
+CRYPTO_SL         = 3.0   # wider stop: daily noise on BTC is 1-2%
+CRYPTO_TS_MINS    = 9999  # no time stop on crypto
 TRAIL_ACTIVATE    = 1.5
 TRAIL_DIST        = 0.5
 MAX_POSITIONS     = 6
@@ -174,8 +174,8 @@ ATR_STOP_MULT     = 1.0      # stop  = 1.0 x expected hold-horizon move
 ATR_TGT_MULT      = 2.0      # target= 2.0 x  (keeps ~2:1, your 33% breakeven)
 STK_STOP_MIN,STK_STOP_MAX = 0.4, 2.0
 STK_TGT_MIN, STK_TGT_MAX  = 0.8, 4.0
-CRY_STOP_MIN,CRY_STOP_MAX = 0.8, 3.0
-CRY_TGT_MIN, CRY_TGT_MAX  = 1.6, 6.0
+CRY_STOP_MIN,CRY_STOP_MAX = 2.0, 5.0
+CRY_TGT_MIN, CRY_TGT_MAX  = 4.0, 12.0
 MANDATORY         = {"MACD +ve", "RSI 38-58"}
 MIN_CONFIRM       = 2
 MIN_SCORE         = 70
@@ -796,7 +796,6 @@ def check_exit(sym, price):
     if pnl>=tp:  return f"+{pnl:.2f}% take profit 🟢"
     if pnl<=-sl: return f"{pnl:.2f}% stop loss 🔴"
     if mins>=ts and pnl<TIME_STOP_FLOOR: return f"{pnl:+.2f}% after {mins:.0f}m — dead trade ⏱"
-    if mins>=240: return f"{pnl:+.2f}% after {mins:.0f}m — max 4h hold ⏱"
     return None
 
 # ── Guards before entry (full stack) ──────────────────────────────────────────
