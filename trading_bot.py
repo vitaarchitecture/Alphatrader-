@@ -1,5 +1,5 @@
 """
-AlphaTrader Bot v22 — EOD Hold + Crypto Swing Edition
+AlphaTrader Bot v22 — EOD Hold + Crypto Swing Edition (full time stop removal)
 v20: full audit of v19 found its flatten fix was still wrong when the
 market is closed: (a) wait_for_fill cancels unfilled orders on timeout,
 killing the very GTC order meant to queue for the open; (b) the next
@@ -795,7 +795,7 @@ def check_exit(sym, price):
         return f"Trailing stop ({pnl:+.2f}%) 📉"
     if pnl>=tp:  return f"+{pnl:.2f}% take profit 🟢"
     if pnl<=-sl: return f"{pnl:.2f}% stop loss 🔴"
-    if mins>=ts and pnl<TIME_STOP_FLOOR: return f"{pnl:+.2f}% after {mins:.0f}m — dead trade ⏱"
+    # Time stop fully removed (v22 fix): all positions run to EOD, target, or stop
     return None
 
 # ── Guards before entry (full stack) ──────────────────────────────────────────
