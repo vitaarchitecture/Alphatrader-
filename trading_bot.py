@@ -1,95 +1,32 @@
 """
-AlphaTrader Bot v22 — EOD Hold + Crypto Swing Edition (full time stop removal)
-v20: full audit of v19 found its flatten fix was still wrong when the
-market is closed: (a) wait_for_fill cancels unfilled orders on timeout,
-killing the very GTC order meant to queue for the open; (b) the next
-reconcile pass's cancel_symbol_orders would kill it anyway; (c) re-placing
-reused the same client_order_id -> 422 spam. Net effect: no standing
-buy-back existed overnight, only log noise.
+AlphaTrader Bot v23 — Pure Crypto Swing Edition
+================================================
+Decision (Sep 3, 2026), evidence from 65 clean trades over 3 weeks:
+  * Signal engine is real (55% win rate) but stocks produced ZERO take
+    profits — intraday moves never reach ATR targets before the close.
+  * Both take profits in the entire trial came from BTC overnight.
+  * The bot's only structural edge is that it never sleeps. Day-trading
+    stocks throws that away; 24/7 crypto swings exploit it.
 
-v20 flatten protocol (tested against a closed-market mock):
-  1. If an open BUY for the symbol already exists -> it IS the queued
-     flatten. Leave it alone. Do nothing else that pass.
-  2. Cancel only SELL-side strays (they are how shorts happen), never
-     our own buy-back.
-  3. Place the GTC buy with a unique id; if market open, wait+verify;
-     if closed, LEAVE IT QUEUED (no wait_for_fill, no cancel).
-  4. When a later pass sees the symbol flat and an alert was pending,
-     send ONE '✅ flattened' confirmation.
-Also: ignore dust positions (<$1) instead of adopting them; whole-share
-fallback refuses symbols where 1 share costs >3x MAX_NOTIONAL.
-v19 fixes a real incident: v18's reconcile() tried to flatten a short with
-a DAY market order for a STOCK outside market hours. Day orders can't
-execute (or even queue reliably) when the exchange is shut, so the buy
-silently failed and the same "flattening now" alert repeated every 60s
-forever with no way to stop.
-
-Fixes:
-  * Flatten order uses time_in_force="gtc" for stocks too — queues and
-    fills at next open instead of silently failing when markets are shut.
-  * The flatten VERIFIES the fill (checks broker qty afterward) before
-    declaring success — no more "tried and moved on" with no confirmation.
-  * Per-symbol alert cooldown (10 min): the short IS still being worked
-    every reconcile pass, but you are only told about it once per window,
-    not every single minute.
-  * If markets are closed and the symbol is a stock, the first alert
-    says so explicitly, so you know why it can't fill immediately.
-v18 on top of v17 (the two 'expert review' fixes, plus visibility):
-  * ALL indicators now computed on 1-MINUTE BARS, not raw ticks.
-    Ticks arrive at wildly different rates per symbol, so tick-RSI meant
-    something different for every stock at every moment. Bars are
-    aggregated live from the websocket and BACKFILLED via REST at startup
-    — 100 bars of history from minute one, no more 30-min warm-up.
-  * ATR-SCALED EXITS + CONSTANT-RISK SIZING: each entry gets a stop and
-    target derived from that symbol's own measured volatility (ATR14 on
-    1-min bars, scaled to the hold horizon, clamped). Position size is
-    then set so every trade risks the same ~$0.25. SMCI's stop is wide,
-    AAPL's is tight, and a stop-out costs the same either way.
-  * CRYPTO RE-ENABLED (2 slots): the pause reason — degenerate snapshot
-    RSI — is gone. Crypto indicators come from real 1-min OHLC bars.
-  * TELEGRAM COMMANDS: message the bot /balance /summary /positions
-    /status /help any time for live account state on demand.
-v17 on top of v16:
-  * TRUE $20 sizing: stocks try notional (fractional) market orders first,
-    auto-fallback to whole-share if the account rejects notional.
-  * Blocked-signal telemetry: every rejected signal is counted by reason
-    and reported in the daily summary — filter tuning becomes data-driven.
-  * Volatility A/B in summary: P&L split high-vol vs mega-cap vs other.
-  * Sentiment re-added as ASYNC ADVISORY (never blocks/vetoes entries;
-    logged and attached to trades for later evaluation).
-  * Real VIX level via FMP ^VIX quote (old VIXY-price proxy was wrong).
-  * Daily P&L / telemetry reset once per trading day (was: repeated 9:00-9:35).
-  * session_trades cleared after summary (multi-day summaries were wrong).
-  * Missed-EOD alert on startup if stocks are held while market closed.
-  * Exit spawn throttle via exit_pending set.
-==========================================
-Architectural changes (why this version exists):
-
-  PROBLEM (v8-v15): resting GTC stop/target orders at the broker kept
-  firing into already-closed positions, creating accidental SHORTS
-  (SMCI -8, XOM -1). Duplicate buys slipped through 1s apart. The EOD
-  close re-fired 10+ times. Internal state drifted from Alpaca reality.
-
-  SOLUTION (v16):
-  1. ZERO resting orders. All stops/targets/time-stops are software-
-     managed from live prices. Any open order at Alpaca is treated as
-     foreign and cancelled on sight.
-  2. ONE exit path: close_position(). It cancels symbol orders, then
-     VERIFIES real holdings at Alpaca, and only sells what actually
-     exists. Selling a flat position is structurally impossible.
-  3. IDEMPOTENT orders: deterministic client_order_id per signal +
-     an in_flight guard. The same buy/sell cannot execute twice —
-     locally or at the broker.
-  4. RECONCILER: every 60s internal state is diffed against Alpaca.
-     Longs we don't know -> adopted. Positions that vanished -> purged.
-     Qty drift -> corrected. SHORTS -> alert + auto-flattened (buy back).
-  5. EOD close fires exactly once per day.
-  6. Entries verify their own fill (poll up to 10s) and record the
-     REAL filled qty/price, not an estimate.
-
-  Crypto remains PAUSED for entries (MAX_CRYPTO_POSITIONS=0) until the
-  data feed is rebuilt on 1-minute bars — 30s snapshot RSI was degenerate.
-  Any adopted crypto position is still exit-managed.
+v23 changes:
+  1. PURE CRYPTO: stocks disabled (MAX_STOCK_POS=0, websocket not started).
+     Universe: BTC/USD, ETH/USD, SOL/USD, AVAX/USD, LINK/USD. 4 slots.
+  2. SWING TIMEFRAME: crypto indicators on 15-MINUTE bars (not 1-min).
+     1-min RSI is noise for a multi-day hold; 15-min RSI/MACD describe a
+     tradeable trend. ATR horizon = 3 days, scaled properly by bar size.
+  3. TRAILING STOP FIXED FOR SWINGS: the old trail activated at +1.5% and
+     trailed 0.5% — it was cutting crypto at ~+1% before targets of +6%.
+     Now scales with the position: arms at 50% of target, trails at
+     50% of the stop distance.
+  4. QUALITY OVER FREQUENCY: crypto minimum score 80 (was 70) and a
+     1-hour re-entry cooldown after any exit. Fees are 0.25%/side.
+  5. FEES REPORTED: each crypto trade records an estimated fee; summary
+     shows gross, fees, net.
+  6. PAPER-CALIBRATED SIZE: ~$1.00 risk/trade so P&L is readable
+     (~$20-50 positions). This is a dial, not a strategy parameter —
+     it scales with capital when live.
+  7. Daily P&L/telemetry now reset 7 days a week (crypto has no weekend).
+Exits: target, stop, scaled trail. No time stop. No EOD. Ever.
 """
 
 import os, re, time, math, json, logging, threading
@@ -97,7 +34,7 @@ import requests, websocket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
-VERSION = "v22"
+VERSION = "v23"
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -133,7 +70,8 @@ SYMBOLS = {
 TRADEABLE      = {k:v for k,v in SYMBOLS.items() if k != "SPY"}
 HIGHVOL_GROUP  = {"SMCI","PLTR","TSLA","MU"}
 MEGA_GROUP     = {"AAPL","MSFT","GOOGL","META","AMZN","NVDA","NFLX"}
-CRYPTO_SYMBOLS = {"BTC/USD":"crypto", "ETH/USD":"crypto"}
+CRYPTO_SYMBOLS = {"BTC/USD":"crypto","ETH/USD":"crypto","SOL/USD":"crypto",
+                  "AVAX/USD":"crypto","LINK/USD":"crypto"}
 
 def to_alpaca(sym):   return sym.replace("/", "")
 def fmt_qty(q):
@@ -157,9 +95,9 @@ CRYPTO_SL         = 3.0   # wider stop: daily noise on BTC is 1-2%
 CRYPTO_TS_MINS    = 9999  # no time stop on crypto
 TRAIL_ACTIVATE    = 1.5
 TRAIL_DIST        = 0.5
-MAX_POSITIONS     = 6
-MAX_STOCK_POS     = 4
-MAX_CRYPTO_POS    = 2        # re-enabled: indicators now on 1-min bars
+MAX_POSITIONS     = 4
+MAX_STOCK_POS     = 0        # stocks DISABLED in v23
+MAX_CRYPTO_POS    = 4        # pure crypto: 4 slots
 DAILY_LOSS_LIMIT  = 10
 PORT_HARD_STOP    = 10.0
 VIX_PAUSE         = 25
@@ -167,6 +105,13 @@ EARN_BLACKOUT_D   = 3
 FEAR_GREED_PAUSE  = 20
 PREGAP_LIMIT      = 2.0
 SIGNAL_COOLDOWN   = 300
+CRYPTO_MIN_SCORE  = 80       # quality over frequency (stocks keep MIN_SCORE)
+CRYPTO_BAR_TF     = "15Min"  # swing timeframe for crypto indicators
+CRYPTO_BAR_MIN    = 15
+CRYPTO_HORIZON_MIN= 4320     # 3-day expected hold for ATR scaling
+CRYPTO_RISK       = 1.00     # $ risked at stop per crypto trade (paper-calibrated dial)
+CRYPTO_FEE_PCT    = 0.25     # Alpaca crypto fee per side, %
+CRYPTO_REENTRY_S  = 3600     # 1h cooldown on a symbol after any exit
 RISK_PER_TRADE    = 0.25     # dollars risked at the stop, every trade
 MIN_NOTIONAL      = 5
 MAX_NOTIONAL      = 60
@@ -329,7 +274,7 @@ def place_entry(sym, price, score, met):
         in_flight.add(sym)
     try:
         stop_pct,target_pct=atr_exits(sym,is_c)
-        tv=size_for(stop_pct)                       # constant $ risk per trade
+        tv=size_for(stop_pct, CRYPTO_RISK if is_c else RISK_PER_TRADE)
         if score>=85: tv*=1.25
         elif score<75: tv*=0.75
         if consecutive_losses>=2: tv*=0.5
@@ -454,8 +399,10 @@ def close_position(sym, reason, ref_price=None):
         with state_lock:
             daily_pnl+=pnl_abs
             consecutive_losses=0 if pnl_abs>0 else consecutive_losses+1
+            fee=(pos["entry_price"]*fq+exit_p*fq)*CRYPTO_FEE_PCT/100 if pos.get("is_crypto") else 0.0
+            last_exit[sym]=time.time()
             session_trades.append({"symbol":sym,"entry":pos["entry_price"],"exit":exit_p,
-                "qty":fq,"pnl_abs":pnl_abs,"pnl_pct":pnl_pct,"reason":reason,
+                "qty":fq,"pnl_abs":pnl_abs,"pnl_pct":pnl_pct,"reason":reason,"fee":fee,
                 "held_mins":(time.time()-pos["entry_time"])/60,
                 "sentiment":pos.get("sentiment"),
                 "group":"highvol" if sym in HIGHVOL_GROUP else
@@ -607,8 +554,8 @@ def parse_bars(payload_bars):
     return out
 
 def backfill_bars():
-    """Warm 100 x 1-min bars per symbol at startup — signals from minute one."""
-    for sym in SYMBOLS:
+    """Warm bars per symbol at startup — signals from minute one."""
+    for sym in (SYMBOLS if MAX_STOCK_POS>0 else []):
         try:
             r=requests.get(f"{ALPACA_DATA}/v2/stocks/{sym}/bars",
                 params={"timeframe":"1Min","limit":100,"feed":"iex"},
@@ -620,7 +567,7 @@ def backfill_bars():
         time.sleep(0.05)
     try:
         r=requests.get(f"{ALPACA_DATA}/v1beta3/crypto/us/bars",
-            params={"timeframe":"1Min","limit":100,
+            params={"timeframe":CRYPTO_BAR_TF,"limit":100,
                     "symbols":",".join(CRYPTO_SYMBOLS)},
             headers=_hdrs(),timeout=10)
         if r.ok:
@@ -651,8 +598,9 @@ def atr_exits(sym, is_crypto):
     if a is None:
         return ((CRY_STOP_MIN+CRY_STOP_MAX)/2 if is_crypto else STOP_LOSS_PCT,
                 (CRY_TGT_MIN+CRY_TGT_MAX)/2 if is_crypto else TAKE_PROFIT_PCT)
-    horizon=CRYPTO_TS_MINS if is_crypto else TIME_STOP_MINS
-    move=a*math.sqrt(horizon)
+    # sqrt-time scaling in BAR units: horizon minutes / minutes per bar
+    horizon_bars=(CRYPTO_HORIZON_MIN/CRYPTO_BAR_MIN) if is_crypto else TIME_STOP_MINS
+    move=a*math.sqrt(horizon_bars)
     stop=move*ATR_STOP_MULT; tgt=move*ATR_TGT_MULT
     if is_crypto:
         stop=min(max(stop,CRY_STOP_MIN),CRY_STOP_MAX)
@@ -662,9 +610,10 @@ def atr_exits(sym, is_crypto):
         tgt =min(max(tgt, STK_TGT_MIN), STK_TGT_MAX)
     return round(stop,2), round(tgt,2)
 
-def size_for(stop_pct):
-    """Notional so that hitting the stop loses ~RISK_PER_TRADE dollars."""
-    tv=RISK_PER_TRADE/(stop_pct/100.0)
+def size_for(stop_pct, risk=None):
+    """Notional so that hitting the stop loses ~risk dollars."""
+    risk=RISK_PER_TRADE if risk is None else risk
+    tv=risk/(stop_pct/100.0)
     return min(max(tv,MIN_NOTIONAL),MAX_NOTIONAL)
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -773,7 +722,8 @@ def evaluate(sym):
           ("Volume confirmed",vol_ok(sym),                             10)]
     met={n for n,p,_ in crit if p}
     score=sum(w for n,p,w in crit if p)
-    ok=MANDATORY.issubset(met) and len(met-MANDATORY)>=MIN_CONFIRM and score>=MIN_SCORE
+    need=CRYPTO_MIN_SCORE if sym in CRYPTO_SYMBOLS else MIN_SCORE
+    ok=MANDATORY.issubset(met) and len(met-MANDATORY)>=MIN_CONFIRM and score>=need
     return {"symbol":sym,"price":price,"signal":"BUY" if ok else "WAIT",
             "met":sorted(met),"score":score}
 
@@ -786,10 +736,13 @@ def check_exit(sym, price):
     ts=CRYPTO_TS_MINS if ic else TIME_STOP_MINS
     pnl=(price-pos["entry_price"])/pos["entry_price"]*100
     mins=(time.time()-pos["entry_time"])/60
-    if pnl>=TRAIL_ACTIVATE:
+    # Trail scaled to the position: crypto swings need room to breathe.
+    act =(tp*0.5) if ic else TRAIL_ACTIVATE     # arm at half the target
+    dist=(sl*0.5) if ic else TRAIL_DIST         # trail at half the stop
+    if pnl>=act:
         if price>pos.get("peak",0):
             pos["peak"]=price
-            nt=price*(1-TRAIL_DIST/100)
+            nt=price*(1-dist/100)
             if nt>(pos.get("trail") or 0): pos["trail"]=nt
     if pos.get("trail") and price<pos["trail"]:
         return f"Trailing stop ({pnl:+.2f}%) 📉"
@@ -822,8 +775,12 @@ def count_block(reason):
     with state_lock:
         block_counts[reason]=block_counts.get(reason,0)+1
 
+last_exit={}   # sym -> time of last close (re-entry cooldown)
+
 def try_enter(sym):
     if time.time()-last_signal.get(sym,0)<SIGNAL_COOLDOWN: return
+    if sym in CRYPTO_SYMBOLS and time.time()-last_exit.get(sym,0)<CRYPTO_REENTRY_S:
+        return
     a=evaluate(sym)
     if not a or a["signal"]!="BUY": return
     last_signal[sym]=time.time()
@@ -883,7 +840,7 @@ def on_tick(sym, price, vol=None):
                 exit_pending.add(sym)
             threading.Thread(target=close_position,args=(sym,r,price),daemon=True).start()
         return
-    if sym in TRADEABLE: try_enter(sym)
+    if sym in TRADEABLE and MAX_STOCK_POS>0: try_enter(sym)
 
 def ws_message(ws,message):
     try:
@@ -940,14 +897,15 @@ def crypto_price(sym):
     return None
 
 def crypto_loop():
-    log.info(f"Crypto monitor started (entries {'ON' if MAX_CRYPTO_POS>0 else 'PAUSED'})")
+    log.info(f"Crypto engine started: {list(CRYPTO_SYMBOLS)} | {CRYPTO_BAR_TF} bars | "
+             f"min score {CRYPTO_MIN_SCORE} | entries {'ON' if MAX_CRYPTO_POS>0 else 'PAUSED'}")
     n=0; fails=0
     while True:
         try:
             n+=1
             try:      # refresh latest 1-min bars for indicators
                 rb=requests.get(f"{ALPACA_DATA}/v1beta3/crypto/us/bars",
-                    params={"timeframe":"1Min","limit":3,
+                    params={"timeframe":CRYPTO_BAR_TF,"limit":3,
                             "symbols":",".join(CRYPTO_SYMBOLS)},
                     headers=_hdrs(),timeout=10)
                 if rb.ok:
@@ -1092,6 +1050,7 @@ def summary_text(clear=False):
         return (f"📊 <b>Summary {VERSION}</b>\nNo completed trades today.\n"
                 f"Signals blocked by: {bl}")
     tot=sum(t["pnl_abs"] for t in trades); wins=sum(1 for t in trades if t["pnl_abs"]>0)
+    fees=sum(t.get("fee",0) for t in trades); net=tot-fees
     by={}
     for t in trades: by.setdefault(t["symbol"],[]).append(t["pnl_abs"])
     lines="\n".join(f"  {s}: ${sum(v):+.2f} ({len(v)})" for s,v in by.items())
@@ -1106,10 +1065,11 @@ def summary_text(clear=False):
     gl=" | ".join(f"{g}: ${v[0]:+.2f} ({v[1]})" for g,v in grp.items())
     bl=", ".join(f"{k}:{v}" for k,v in sorted(blocks.items(),key=lambda x:-x[1])[:5]) or "none"
     return (f"📊 <b>Summary {VERSION}</b>\n"
-            f"Trades: {len(trades)} | Wins: {wins} ({wins/len(trades)*100:.0f}%) | P&L ${tot:+.2f}\n"
-            f"Exits — TP:{rx['take profit']} SL:{rx['stop loss']} Time:{rx['⏱']} "
-            f"EOD:{rx['EOD']} Trail:{rx['Trailing']}\n"
-            f"Groups — {gl}\n{lines}\nBlocked: {bl}")
+            f"Trades: {len(trades)} | Wins: {wins} ({wins/len(trades)*100:.0f}%)\n"
+            f"Gross ${tot:+.2f} | Fees -${fees:.2f} | <b>Net ${net:+.2f}</b>\n"
+            f"Exits — TP:{rx['take profit']} SL:{rx['stop loss']} "
+            f"Trail:{rx['Trailing']} EOD:{rx['EOD']} Time:{rx['⏱']}\n"
+            f"{lines}\nBlocked: {bl}")
 
 def status_text():
     with state_lock:
@@ -1197,20 +1157,24 @@ def startup():
 
     with state_lock:
         held=", ".join(f"{s}({positions[s]['qty']})" for s in positions) or "none"
-    telegram(f"🚀 <b>AlphaTrader {VERSION} — Bars + ATR Risk</b> "
+    telegram(f"🚀 <b>AlphaTrader {VERSION} — Pure Crypto Swing</b> "
              f"{'📄 PAPER' if IS_PAPER else '💰 LIVE'}\n"
-             f"Indicators on 1-min bars (backfilled) | ATR exits, ~${RISK_PER_TRADE:.2f} risk/trade\n"
-             f"Crypto entries: {'ON (bars-based)' if MAX_CRYPTO_POS>0 else 'PAUSED'}\n"
-             f"Slots: {MAX_POSITIONS} ({MAX_STOCK_POS} stock/{MAX_CRYPTO_POS} crypto) | size ${BASE_TRADE_SIZE}\n"
-             f"Exits: software-managed, zero resting orders, 60s reconciler\n"
-             f"💬 Message /help for live commands\n"
-             f"Recovered positions: {held}\n"
+             f"Universe: {', '.join(CRYPTO_SYMBOLS)} | {MAX_CRYPTO_POS} slots\n"
+             f"Indicators: {CRYPTO_BAR_TF} bars | min score {CRYPTO_MIN_SCORE}\n"
+             f"Exits: ATR swing +{CRY_TGT_MIN}-{CRY_TGT_MAX}% / -{CRY_STOP_MIN}-{CRY_STOP_MAX}% "
+             f"| trail arms at 50% of target\n"
+             f"Risk ~${CRYPTO_RISK:.2f}/trade | fees {CRYPTO_FEE_PCT}%/side | 1h re-entry cooldown\n"
+             f"Stocks: {'ON' if MAX_STOCK_POS>0 else 'OFF'} | No time stop | No EOD close\n"
+             f"💬 /help for commands | Recovered: {held}\n"
              f"Portfolio ${starting_pv:,.0f} | hard stop -{PORT_HARD_STOP}%")
 
 def main():
     global eod_done_date, summary_done_date, last_trading_date
     startup()
-    threading.Thread(target=ws_loop,daemon=True).start()
+    if MAX_STOCK_POS>0:
+        threading.Thread(target=ws_loop,daemon=True).start()
+    else:
+        log.info("Stocks disabled (MAX_STOCK_POS=0) — websocket not started")
     threading.Thread(target=crypto_loop,daemon=True).start()
     threading.Thread(target=reconciler_loop,daemon=True).start()
     threading.Thread(target=telegram_listener,daemon=True).start()
@@ -1224,7 +1188,7 @@ def main():
             # once-per-trading-day reset (first weekday pass after 09:00 ET)
             global last_trading_date
             _,_,wd=now_et()
-            if wd<5 and h>=9 and last_trading_date!=today:
+            if h>=9 and last_trading_date!=today:   # crypto trades 7 days
                 last_trading_date=today
                 with state_lock:
                     globals()['daily_pnl']=0.0
