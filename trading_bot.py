@@ -114,6 +114,7 @@ CRYPTO_FEE_PCT    = 0.25     # Alpaca crypto fee per side, %
 CRYPTO_REENTRY_S  = 3600     # 1h cooldown on a symbol after any exit
 RISK_PER_TRADE    = 0.25     # dollars risked at the stop, every trade
 MIN_NOTIONAL      = 5
+CRYPTO_MIN_NOTIONAL = 12     # Alpaca min order (BTC 0.0001 ~= $8) + headroom
 MAX_NOTIONAL      = 60
 ATR_STOP_MULT     = 1.0      # stop  = 1.0 x expected hold-horizon move
 ATR_TGT_MULT      = 2.0      # target= 2.0 x  (keeps ~2:1, your 33% breakeven)
@@ -278,13 +279,16 @@ def place_entry(sym, price, score, met):
         if score>=85: tv*=1.25
         elif score<75: tv*=0.75
         if consecutive_losses>=2: tv*=0.5
-        if econ_blackout: tv*=0.5
-        tv=min(max(tv,MIN_NOTIONAL),MAX_NOTIONAL)
+        if econ_blackout and not is_c: tv*=0.5   # equity-event sizing cut: stocks only
+        floor_ = CRYPTO_MIN_NOTIONAL if is_c else MIN_NOTIONAL
+        tv=min(max(tv,floor_),MAX_NOTIONAL)
 
         acct=get_account()
         if not acct: return
         tv=min(tv, float(acct.get("buying_power",0))*0.95)
-        if tv<5: return
+        if tv < (CRYPTO_MIN_NOTIONAL if is_c else 5):
+            log.warning(f"{sym} skipped: sized ${tv:.2f} below minimum order size")
+            return
 
         global notional_ok
         coid=f"at17-{to_alpaca(sym)}-{int(time.time())//SIGNAL_COOLDOWN}"  # broker-side dedupe window
@@ -1205,7 +1209,11 @@ def main():
                         close_position(s,"EOD close",hst[-1] if hst else None)
             if h==16 and m<5 and summary_done_date!=today:
                 summary_done_date=today; daily_summary()
-            if is_market_hours() and m%5==0: hard_stop_check()
+            # v23.1 BUGFIX: hard stop must run 24/7 — this is a crypto bot.
+            # Previously gated by is_market_hours(), leaving the -10% portfolio
+            # protection OFF overnight and all weekend, i.e. most of the time
+            # the bot actually trades.
+            if m%5==0: hard_stop_check()
         except Exception as e:
             log.error(f"main: {e}")
         time.sleep(20)
